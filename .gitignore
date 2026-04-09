@@ -1,0 +1,9 @@
+.cursor/
+
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+watcher_settings.db
