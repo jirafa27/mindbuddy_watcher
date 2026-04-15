@@ -4,20 +4,21 @@ import logging
 import threading
 from pathlib import Path
 
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler, FileCreatedEvent, DirCreatedEvent, DirDeletedEvent, FileDeletedEvent, DirMovedEvent, FileModifiedEvent, DirModifiedEvent
 
 logger = logging.getLogger(__name__)
 
 
 class FileWatcherHandler(FileSystemEventHandler):
-    """Отслеживает create/modify/delete события с debounce по пути файла."""
+    """Отслеживает create/modify/delete события по пути файла."""
 
     def __init__(
         self,
-        on_file_changed_callback,
+        on_file_changed_callback=None,
         on_file_deleted_callback=None,
         on_file_moved_callback=None,
         on_folder_moved_callback=None,
+        on_folder_deleted_callback=None,
         should_ignore_callback=None,
         debounce_seconds=1.0,
     ):
@@ -26,6 +27,7 @@ class FileWatcherHandler(FileSystemEventHandler):
         self.on_file_deleted = on_file_deleted_callback
         self.on_file_moved = on_file_moved_callback
         self.on_folder_moved = on_folder_moved_callback
+        self.on_folder_deleted = on_folder_deleted_callback
         self.should_ignore_callback = should_ignore_callback
         self.debounce_seconds = debounce_seconds
         self._timers = {}
@@ -43,6 +45,14 @@ class FileWatcherHandler(FileSystemEventHandler):
         )
 
     def _schedule_event(self, file_path: Path, event_type: str):
+        """
+        Планирует событие на выполнение.
+        Нужно для того, чтобы не обрабатывать события слишком часто.
+        редакторы часто сохраняют файл несколькими системными событиями
+        без debounce watcher отправит несколько одинаковых запросов
+        можно поймать файл в момент, когда он ещё не до конца записан
+        """
+
         if self.is_temporary_file(file_path):
             return
 
@@ -80,23 +90,29 @@ class FileWatcherHandler(FileSystemEventHandler):
             self.on_file_changed(file_path, event_type)
 
     def on_created(self, event):
-        """Обработка создания файла."""
-        if not event.is_directory:
-            self._schedule_event(Path(event.src_path), "created")
+        """Обработка создания файла или папки."""
+        if isinstance(event, FileCreatedEvent):
+            self._schedule_event(Path(event.src_path), "create_file")
+        elif isinstance(event, DirCreatedEvent):
+            self._schedule_event(Path(event.src_path), "create_folder")
+
 
     def on_modified(self, event):
         """Обработка изменения файла."""
-        if not event.is_directory:
-            self._schedule_event(Path(event.src_path), "modified")
+        if isinstance(event, FileModifiedEvent):
+            self._schedule_event(Path(event.src_path), "modify_file")
+        elif isinstance(event, DirModifiedEvent):
+            self._schedule_event(Path(event.src_path), "modify_folder")
 
     def on_deleted(self, event):
         """Обработка удаления файла."""
-        if event.is_directory:
+        if isinstance(event, DirDeletedEvent):
+            folder_path = Path(event.src_path)
+            logger.info("Обнаружено удаление папки: %s", folder_path)
+            self.on_folder_deleted(folder_path)
             return
-        file_path = Path(event.src_path)
-        if self.is_temporary_file(file_path):
-            return
-        if self.on_file_deleted:
+        elif isinstance(event, FileDeletedEvent):
+            file_path = Path(event.src_path)
             logger.info("Обнаружено удаление файла: %s", file_path)
             self.on_file_deleted(file_path)
 
@@ -105,7 +121,7 @@ class FileWatcherHandler(FileSystemEventHandler):
         src_path = Path(event.src_path)
         dest_path = Path(event.dest_path)
 
-        if event.is_directory:
+        if isinstance(event, DirMovedEvent):
             if self.on_folder_moved:
                 logger.info("Обнаружено перемещение папки: %s -> %s", src_path, dest_path)
                 self.on_folder_moved(src_path, dest_path)

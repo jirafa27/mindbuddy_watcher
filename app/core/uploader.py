@@ -3,15 +3,16 @@
 import logging
 from pathlib import Path
 
+from app.core.database import SettingsDB
 from app.core.file_utils import build_local_file_meta
 
 logger = logging.getLogger(__name__)
 
 
 class FileUploader:
-    """Загрузчик desktop-версий файлов с учетом sync_state."""
+    """Загрузчик desktop-версий файлов с учетом локального file state."""
 
-    def __init__(self, api_client, local_folder, db=None):
+    def __init__(self, api_client, local_folder, db: SettingsDB):
         self.api_client = api_client
         self.local_folder = Path(local_folder)
         self.db = db
@@ -39,39 +40,48 @@ class FileUploader:
 
         try:
             file_meta = build_local_file_meta(file_path, self.local_folder)
-            relative_path = file_meta["relative_path"]
+            relative_path = file_meta.relative_path
 
-            sync_state = self.db.get_sync_state(relative_path) if self.db else None
+            file_state = self.db.get_file_state(relative_path)
             user_file_id = server_user_file_id if server_user_file_id is not None else (
-                sync_state.get("server_user_file_id") if sync_state else None
+                file_state.get("server_user_file_id") if file_state else None
             )
 
-            if sync_state:
-                same_hash = sync_state.get("content_hash") == file_meta["content_hash"]
-                same_mtime = sync_state.get("last_seen_mtime") == file_meta["last_seen_mtime"]
+            if file_state:
+                same_hash = file_state.get("content_hash") == file_meta.content_hash
+                same_mtime = file_state.get("last_seen_mtime") == file_meta.last_seen_mtime
                 if same_hash and same_mtime:
                     return {"status": "skipped", "message": "Нет изменений"}
 
             result = self.api_client.upload_desktop_file(
                 file_path=file_path,
                 relative_path=relative_path,
-                desktop_updated_at=file_meta["desktop_updated_at"],
                 user_file_id=user_file_id,
-                known_hash=sync_state.get("content_hash") if sync_state else None,
             )
 
             if not result.ok:
                 return {"status": "failed", "message": result.message or "Upload не удался"}
 
-            if self.db:
-                self.db.upsert_sync_state(
-                    relative_path,
-                    content_hash=result.content_hash or file_meta["content_hash"],
-                    last_uploaded_at=result.updated_at or file_meta["desktop_updated_at"],
-                    last_seen_mtime=file_meta["last_seen_mtime"],
-                    server_user_file_id=result.file_id,
-                    is_applying_remote=0,
+            file_payload = result.raw.get("file", {}) if isinstance(result.raw, dict) else {}
+            namespace_id = file_payload.get("namespace_id") if isinstance(file_payload, dict) else None
+            parent_parts = Path(relative_path).parts[:-1]
+            for index in range(len(parent_parts)):
+                folder_path = Path(*parent_parts[: index + 1]).as_posix()
+                parent_path = Path(*parent_parts[:index]).as_posix() if index > 0 else None
+                self.db.upsert_folder_state(
+                    folder_path,
+                    namespace_id=namespace_id if index == len(parent_parts) - 1 else None,
+                    parent_relative_path=parent_path,
                 )
+            self.db.upsert_file_state(
+                relative_path,
+                content_hash=result.content_hash or file_meta.content_hash,
+                last_uploaded_at=result.updated_at or file_meta.desktop_updated_at,
+                last_seen_mtime=file_meta.last_seen_mtime,
+                server_user_file_id=result.file_id,
+                namespace_id=namespace_id,
+                is_applying_remote=0,
+            )
 
             return {
                 "status": "uploaded",

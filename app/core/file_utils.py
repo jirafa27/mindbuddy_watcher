@@ -3,7 +3,8 @@
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+
+from app.core.contracts import FileInfo, LocalFileMeta
 
 
 def compute_file_hash(file_path: Path) -> str:
@@ -27,13 +28,26 @@ def normalize_relative_path(file_path: Path, root_folder: Path) -> str:
     return str(file_path.resolve().relative_to(root_folder.resolve())).replace("\\", "/")
 
 
-def build_local_file_meta(file_path: Path, root_folder: Path) -> Dict[str, str]:
-    """Собирает метаданные локального файла для upload/sync."""
+def build_local_file_meta(file_path: Path, root_folder: Path) -> LocalFileMeta:
+    """Собирает локальные метаданные файла для file state и upload."""
     stat_result = file_path.stat()
-    return {
-        "relative_path": normalize_relative_path(file_path, root_folder),
-        "content_hash": compute_file_hash(file_path),
-        "desktop_updated_at": isoformat_from_timestamp(stat_result.st_mtime),
-        "last_seen_mtime": stat_result.st_mtime,
-        "file_size": stat_result.st_size,
-    }
+    return LocalFileMeta(
+        relative_path=normalize_relative_path(file_path, root_folder),
+        filename=file_path.name,
+        file_size=stat_result.st_size,
+        content_hash=compute_file_hash(file_path),
+        desktop_updated_at=isoformat_from_timestamp(stat_result.st_mtime),
+        last_seen_mtime=stat_result.st_mtime,
+    )
+
+
+def build_local_file_info(file_path: Path) -> FileInfo:
+    """Собирает описание файла в формате backend `FileInfo`."""
+    stat_result = file_path.stat()
+    return FileInfo(
+        id=None,
+        filename=file_path.name,
+        file_size=stat_result.st_size,
+        updated_at=isoformat_from_timestamp(stat_result.st_mtime),
+        content_hash=compute_file_hash(file_path),
+    )

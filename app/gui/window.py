@@ -90,11 +90,37 @@ class WatcherGUI:
         
     def select_folder(self):
         """Выбор папки для файлов"""
+        previous_folder = self.selected_folder
         folder = filedialog.askdirectory(title="Выберите папку для файлов")
         if folder:
-            self.selected_folder = Path(folder)
+            new_folder = Path(folder)
+            if previous_folder and new_folder == previous_folder:
+                return
+
+            self.selected_folder = new_folder
             self.folder_label.config(text=str(self.selected_folder))
             self.log(f"Выбрана папка: {self.selected_folder}")
+
+            if self.app.running:
+                should_restart = messagebox.askyesno(
+                    "Перезапустить watcher?",
+                    "Watcher сейчас запущен.\n\n"
+                    "Чтобы применить новую папку, watcher будет остановлен и запущен заново. "
+                    "Если для новой папки и токена есть расхождения с сервером, появится диалог initial sync.\n\n"
+                    "Перезапустить сейчас?",
+                    parent=self.root,
+                )
+                if not should_restart:
+                    self.selected_folder = previous_folder
+                    self.folder_label.config(
+                        text=str(previous_folder) if previous_folder else "Не выбрана"
+                    )
+                    self.log("Смена папки отменена: watcher продолжает работать со старой папкой")
+                    return
+
+                self.log("Папка изменена во время работы watcher, выполняю перезапуск...")
+                self.stop_watcher()
+                self.start_watcher()
             
     def start_watcher(self):
         """Запуск watcher"""
@@ -275,6 +301,84 @@ class WatcherGUI:
 
         self.root.wait_window(dialog)
         return result["strategy"]
+
+    def ask_initial_sync_strategy(self) -> Optional[SyncStrategy]:
+        """Диалог выбора направления при первичной инициализации."""
+        result = {"strategy": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Первичная синхронизация")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self.root)
+
+        tk.Label(
+            dialog,
+            text="Обнаружены данные и на ПК, и на сервере.",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor=tk.W, padx=15, pady=(15, 5))
+
+        tk.Label(
+            dialog,
+            text="Выберите, какую сторону сделать источником истины для первичной инициализации.",
+            justify=tk.LEFT,
+            wraplength=420,
+        ).pack(anchor=tk.W, padx=15, pady=(0, 10))
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+
+        def choose(strategy):
+            result["strategy"] = strategy
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame,
+            text="ПК → Сервер\n(сервер будет заменён содержимым ПК)",
+            command=lambda: choose(SyncStrategy.PC_PRIORITY),
+            width=25,
+            height=3,
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Сервер → ПК\n(ПК будет заменён содержимым сервера)",
+            command=lambda: choose(SyncStrategy.SERVER_PRIORITY),
+            width=25,
+            height=3,
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Отмена",
+            command=dialog.destroy,
+            width=10,
+            height=3,
+        ).pack(side=tk.LEFT, padx=5)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        self.root.wait_window(dialog)
+        return result["strategy"]
+
+    def confirm_initial_sync_replace(self, strategy: SyncStrategy) -> bool:
+        """Подтверждение полной замены одной стороны другой при initial sync."""
+        if strategy == SyncStrategy.SERVER_PRIORITY:
+            title = "Заменить локальную папку?"
+            message = (
+                "Все локальные файлы и папки будут удалены и заменены данными с сервера.\n\n"
+                "Продолжить?"
+            )
+        else:
+            title = "Заменить серверное пространство?"
+            message = (
+                "Все серверные файлы и папки будут удалены и заменены данными с ПК.\n\n"
+                "Продолжить?"
+            )
+        return messagebox.askyesno(title, message, parent=self.root)
 
     def on_closing(self):
         """Обработка закрытия окна"""

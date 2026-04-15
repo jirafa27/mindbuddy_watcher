@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.core.contracts import SyncCommand, SyncFileMeta, UploadResult
+from app.core.contracts import NamespaceStructureItem, SyncCommand, UploadResult
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ class SyncAPIClient:
         self.sync_commands_endpoint = f"{self.base_url}/sync/commands"
         self.sync_structure_endpoint = f"{self.base_url}/sync/structure"
         self.sync_file_content_endpoint = f"{self.base_url}/sync/file-content"
+        self.sync_namespaces_endpoint = f"{self.base_url}/sync/namespaces"
+        self.namespaces_endpoint = f"{self.base_url}/namespaces/"
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -64,39 +66,39 @@ class SyncAPIClient:
         self,
         file_path: Path,
         relative_path: str,
-        desktop_updated_at: str,
         user_file_id: Optional[int] = None,
-        known_hash: Optional[str] = None,
     ) -> UploadResult:
-        """Загружает локальную desktop-версию файла как каноническую."""
+        """Загружает локальную desktop-версию файла на сервер"""
         try:
             payload = {
                 "relative_path": relative_path,
-                "desktop_updated_at": desktop_updated_at,
                 "vault_name": self.vault_name,
             }
             if user_file_id is not None:
                 payload["user_file_id"] = user_file_id
-            if known_hash is not None:
-                payload["known_hash"] = known_hash
 
             with open(file_path, "rb") as file_handle:
                 response = self.session.post(
                     self.sync_upload_endpoint,
                     headers=self._headers(),
-                    data=self._params(payload),
+                    data=payload,
                     files={"file": (file_path.name, file_handle, "application/octet-stream")},
                     timeout=self.timeout,
                 )
 
             payload = self._extract_data(response) if response.content else {}
             if response.ok:
+                file_payload = payload.get("file", {}) if isinstance(payload, dict) else {}
                 return UploadResult(
                     ok=True,
                     status="uploaded",
-                    content_hash=payload.get("content_hash") if isinstance(payload, dict) else None,
-                    updated_at=(payload.get("updated_at") if isinstance(payload, dict) else None) or desktop_updated_at,
-                    file_id=int(payload["file_id"]) if isinstance(payload, dict) and payload.get("file_id") is not None else None,
+                    content_hash=file_payload.get("content_hash") if isinstance(file_payload, dict) else None,
+                    updated_at=file_payload.get("updated_at") if isinstance(file_payload, dict) else None,
+                    file_id=(
+                        int(file_payload["user_file_id"])
+                        if isinstance(file_payload, dict) and file_payload.get("user_file_id") is not None
+                        else None
+                    ),
                     raw=payload if isinstance(payload, dict) else {},
                 )
 
@@ -168,57 +170,91 @@ class SyncAPIClient:
             logger.error("Ошибка ACK команды %s: %s", command_id, error)
             return False
 
-    def get_files_structure(self) -> Dict[str, SyncFileMeta]:
-        """Получает структуру файлов с backend, возвращает плоский словарь {relative_path: SyncFileMeta}."""
+    def get_files_server_structure(self) -> List[NamespaceStructureItem]:
+        """Получает структуру файлов с backend, возвращает список NamespaceStructureItem."""
         try:
             url = self.sync_structure_endpoint
-            params = self._params()
-            logger.info("get_files_structure → GET %s params=%s", url, params)
+            logger.info("get_files_server_structure → GET %s", url)
             response = self.session.get(
                 url,
                 headers=self._headers(),
-                params=params,
                 timeout=self.timeout,
             )
             logger.info("get_files_structure ← status=%s", response.status_code)
             if not response.ok:
+                message = f"Не удалось получить снимок файлов: {response.status_code} - {response.text[:400]}"
+                raise RuntimeError(message)
+
+            raw_json = response.json()
+            namespaces = raw_json.get("data", [])
+
+            logger.info("get_files_server_structure: итого namespace=%d", len(namespaces))
+            return sorted([NamespaceStructureItem.from_dict(item) for item in namespaces], key=lambda x: x.id if x.id is not None else 0)
+        except Exception as e:
+            logger.error("Ошибка получения структуры файлов и папок: %s", e)
+            raise
+
+    def create_namespace(
+        self,
+        relative_path: str,
+        description: str = "",
+    ) -> Optional[NamespaceStructureItem]:
+        """Создаёт namespace по sync-эндпоинту watcher."""
+        payload: Dict[str, Any] = {
+            "relative_path": relative_path,
+            "vault_name": self.vault_name,
+            "description": description,
+        }
+
+        try:
+            response = self.session.post(
+                self.sync_namespaces_endpoint,
+                headers=self._headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            if not response.ok:
                 logger.error(
-                    "Не удалось получить снимок файлов: %s - %s",
+                    "Не удалось создать namespace %s: %s - %s",
+                    relative_path,
                     response.status_code,
                     response.text[:400],
                 )
-                return {}
+                return None
 
-            raw_json = response.json()
-            payload = raw_json.get("data", raw_json) if isinstance(raw_json, dict) else raw_json
-            namespaces = payload.get("namespaces", []) if isinstance(payload, dict) else []
-
-            result: Dict[str, SyncFileMeta] = {}
-            self._flatten_namespaces(namespaces, result)
-            logger.info("get_files_structure: итого файлов=%d", len(result))
-            return result
+            payload = self._extract_data(response)
+            if not isinstance(payload, dict):
+                return None
+            return NamespaceStructureItem.from_dict(payload)
         except Exception as error:
-            logger.error("Ошибка получения структуры файлов и папок: %s", error)
-            return {}
+            logger.error("Ошибка создания namespace %s: %s", relative_path, error)
+            return None
 
-    def _flatten_namespaces(self, namespaces: List[Dict[str, Any]], result: Dict[str, SyncFileMeta]):
-        """Рекурсивно разворачивает дерево namespace-ов в плоский словарь файлов."""
-        for ns in namespaces:
-            ns_id = ns.get("id")
-            for file_dict in ns.get("files", []):
-                enriched = {**file_dict, "namespace_id": ns_id}
-                meta = SyncFileMeta.from_dict(enriched)
-                if meta.relative_path:
-                    result[meta.relative_path] = meta
-            children = ns.get("children") or []
-            if children:
-                self._flatten_namespaces(children, result)
-
-    def delete_desktop_file(self, file_id: int) -> bool:
-        """Удаляет файл на сервере по его ID."""
+    def delete_namespace(self, namespace_id: int) -> bool:
+        """Полностью удаляет namespace по sync-эндпоинту watcher."""
         try:
             response = self.session.delete(
-                f"{self.base_url}/files/{file_id}",
+                f"{self.sync_namespaces_endpoint}/{namespace_id}",
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            if not response.ok:
+                logger.error(
+                    "Не удалось удалить namespace id=%s: %s - %s",
+                    namespace_id,
+                    response.status_code,
+                    response.text[:400],
+                )
+            return response.ok
+        except Exception as error:
+            logger.error("Ошибка удаления namespace id=%s: %s", namespace_id, error)
+            return False
+
+    def delete_server_file(self, file_id: int) -> bool:
+        """Полностью удаляет user_file на сервере по его ID."""
+        try:
+            response = self.session.delete(
+                f"{self.base_url}/sync/files/{file_id}",
                 headers=self._headers(),
                 timeout=self.timeout,
             )

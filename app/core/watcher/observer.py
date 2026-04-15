@@ -14,10 +14,11 @@ class FileWatcher:
     def __init__(
         self,
         folder_path,
-        on_file_changed_callback,
+        on_file_changed_callback=None,
         on_file_deleted_callback=None,
         on_file_moved_callback=None,
         on_folder_moved_callback=None,
+        on_folder_deleted_callback=None,
         should_ignore_callback=None,
         debounce_seconds=1.0,
     ):
@@ -26,6 +27,7 @@ class FileWatcher:
         self.on_file_deleted = on_file_deleted_callback
         self.on_file_moved = on_file_moved_callback
         self.on_folder_moved = on_folder_moved_callback
+        self.on_folder_deleted = on_folder_deleted_callback
         self.should_ignore_callback = should_ignore_callback
         self.debounce_seconds = debounce_seconds
         self.observer = None
@@ -39,10 +41,11 @@ class FileWatcher:
             logger.info(f"Создана папка: {self.folder_path}")
             
         self.event_handler = FileWatcherHandler(
-            self.on_file_changed,
+            on_file_changed_callback=self.on_file_changed,
             on_file_deleted_callback=self.on_file_deleted,
             on_file_moved_callback=self.on_file_moved,
             on_folder_moved_callback=self.on_folder_moved,
+            on_folder_deleted_callback=self.on_folder_deleted,
             should_ignore_callback=self.should_ignore_callback,
             debounce_seconds=self.debounce_seconds,
         )

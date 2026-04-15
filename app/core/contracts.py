@@ -1,7 +1,7 @@
 """Контракты синхронизации между watcher, backend и RN."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 
 def _strip_vault_prefix(path: str) -> str:
@@ -15,64 +15,97 @@ def _strip_vault_prefix(path: str) -> str:
 
 
 @dataclass
-class SyncFileMeta:
-    """Метаданные файла, которые backend отдает клиентам."""
+class FileInfo:
+    """Метаданные файла."""
 
-    relative_path: str
-    content_hash: Optional[str] = None
-    updated_at: Optional[str] = None
-    desktop_updated_at: Optional[str] = None
-    app_updated_at: Optional[str] = None
-    download_url: Optional[str] = None
-    file_id: Optional[int] = None
-    namespace_id: Optional[int] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
+    id: Optional[int]
+    filename: str
+    file_size: int
+    updated_at: str
+    content_hash: str
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "SyncFileMeta":
-        # relative_path: прямое поле, "path", или vault_relative_path с обрезкой имени vault
-        relative_path = (
-            payload.get("relative_path")
-            or payload.get("path")
-            or _strip_vault_prefix(payload.get("vault_relative_path") or "")
-            or ""
-        )
-        # file_id: бэкенд может отдавать user_file_id, file_id или id
-        raw_file_id = (
-            payload.get("user_file_id")
-            or payload.get("file_id")
-            or payload.get("id")
-        )
-        raw_namespace_id = payload.get("namespace_id")
+    def from_dict(cls, payload: Dict[str, Any]) -> "FileInfo":
+        file_id = payload.get("id")
+        content_hash = payload.get("content_hash")
+        if content_hash is None:
+            raise ValueError("content_hash is required for FileInfo")
         return cls(
-            relative_path=relative_path,
-            content_hash=payload.get("content_hash"),
+            id=int(file_id) if file_id is not None else None,
+            filename=payload.get("filename"),
+            file_size=payload.get("file_size"),
             updated_at=payload.get("updated_at"),
-            desktop_updated_at=payload.get("desktop_updated_at"),
-            app_updated_at=payload.get("app_updated_at"),
-            download_url=payload.get("download_url"),
-            file_id=int(raw_file_id) if raw_file_id is not None else None,
-            namespace_id=int(raw_namespace_id) if raw_namespace_id is not None else None,
-            extra={
-                key: value
-                for key, value in payload.items()
-                if key
-                not in {
-                    "relative_path",
-                    "path",
-                    "vault_relative_path",
-                    "content_hash",
-                    "updated_at",
-                    "desktop_updated_at",
-                    "app_updated_at",
-                    "download_url",
-                    "file_id",
-                    "user_file_id",
-                    "id",
-                    "namespace_id",
-                }
-            },
+            content_hash=content_hash,
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "filename": self.filename,
+            "file_size": self.file_size,
+            "updated_at": self.updated_at,
+            "content_hash": self.content_hash,
+        }
+
+
+@dataclass
+class LocalFileMeta:
+    """Локальные метаданные файла для upload и file_state."""
+
+    relative_path: str
+    filename: str
+    file_size: int
+    content_hash: str
+    desktop_updated_at: str
+    last_seen_mtime: float
+
+
+@dataclass
+class IndexedFileMeta:
+    """Файл с сервера с уже вычисленным `relative_path` для sync-алгоритма."""
+
+    relative_path: str
+    filename: str
+    file_size: int
+    content_hash: str
+    updated_at: str
+    file_id: Optional[int]
+    namespace_id: Optional[int]
+
+
+@dataclass
+class NamespaceStructureItem:
+    """Namespace для синхронизации."""
+
+    id: Optional[int]
+    name: str
+    parent_id: Optional[int]
+    kind: str
+    files: List[FileInfo] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "NamespaceStructureItem":
+        namespace_id = payload.get("id")
+        name = payload.get("name")
+        parent_id = payload.get("parent_id")
+        kind = payload.get("kind")
+        files = payload.get("files", [])
+        return cls(
+            id=int(namespace_id) if namespace_id is not None else None,
+            name=name,
+            parent_id=int(parent_id) if parent_id is not None else None,
+            kind=kind,
+            files=[FileInfo.from_dict(file) for file in files],
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "parent_id": self.parent_id,
+            "kind": self.kind,
+            "files": [file_info.to_dict() for file_info in self.files],
+        }
 
 
 @dataclass
@@ -87,6 +120,7 @@ class SyncCommand:
     filename: Optional[str] = None
     file_id: Optional[int] = None
     namespace_id: Optional[int] = None
+    target_type: Optional[str] = None
     content_hash: Optional[str] = None
     content: Optional[str] = None
     content_base64: Optional[str] = None
@@ -105,7 +139,12 @@ class SyncCommand:
         if vault_relative:
             relative_path = _strip_vault_prefix(vault_relative)
         else:
-            relative_path = payload.get("relative_path") or payload.get("path") or ""
+            relative_path = (
+                nested.get("relative_path")
+                or payload.get("relative_path")
+                or payload.get("path")
+                or ""
+            )
 
         old_relative_path = _strip_vault_prefix(nested.get("old_vault_relative_path") or "")
         new_relative_path = _strip_vault_prefix(nested.get("new_vault_relative_path") or "")
@@ -121,6 +160,7 @@ class SyncCommand:
             filename=nested.get("filename") or payload.get("filename"),
             file_id=int(raw_file_id) if raw_file_id is not None else None,
             namespace_id=int(raw_namespace_id) if raw_namespace_id is not None else None,
+            target_type=nested.get("target_type") or payload.get("target_type"),
             content_hash=nested.get("content_hash") or payload.get("content_hash"),
             content=nested.get("content") or payload.get("content"),
             content_base64=(
