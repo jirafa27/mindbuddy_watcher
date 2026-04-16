@@ -28,6 +28,17 @@ def normalize_relative_path(file_path: Path, root_folder: Path) -> str:
     return str(file_path.resolve().relative_to(root_folder.resolve())).replace("\\", "/")
 
 
+def is_temporary_file(file_path: Path) -> bool:
+    """Проверяет, что файл временный и его не нужно синхронизировать."""
+    name = file_path.name
+    return (
+        name.startswith("~$")
+        or name.endswith(".tmp")
+        or name.endswith(".temp")
+        or name.startswith(".~")
+    )
+
+
 def build_local_file_meta(file_path: Path, root_folder: Path) -> LocalFileMeta:
     """Собирает локальные метаданные файла для file state и upload."""
     stat_result = file_path.stat()

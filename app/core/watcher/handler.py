@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, DirCreatedEvent, DirDeletedEvent, FileDeletedEvent, DirMovedEvent, FileModifiedEvent, DirModifiedEvent
+from app.core.file_utils import is_temporary_file
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +34,6 @@ class FileWatcherHandler(FileSystemEventHandler):
         self._timers = {}
         self._lock = threading.Lock()
 
-    @staticmethod
-    def is_temporary_file(file_path: Path) -> bool:
-        """Отфильтровывает временные и lock-файлы редакторов."""
-        name = file_path.name
-        return (
-            name.startswith("~$")
-            or name.endswith(".tmp")
-            or name.endswith(".temp")
-            or name.startswith(".~")
-        )
-
     def _schedule_event(self, file_path: Path, event_type: str):
         """
         Планирует событие на выполнение.
@@ -53,7 +43,7 @@ class FileWatcherHandler(FileSystemEventHandler):
         можно поймать файл в момент, когда он ещё не до конца записан
         """
 
-        if self.is_temporary_file(file_path):
+        if is_temporary_file(file_path):
             return
 
         if self.should_ignore_callback and self.should_ignore_callback(file_path):
@@ -79,7 +69,7 @@ class FileWatcherHandler(FileSystemEventHandler):
         with self._lock:
             self._timers.pop(file_key, None)
 
-        if self.is_temporary_file(file_path):
+        if is_temporary_file(file_path):
             return
 
         if self.should_ignore_callback and self.should_ignore_callback(file_path):
@@ -113,6 +103,8 @@ class FileWatcherHandler(FileSystemEventHandler):
             return
         elif isinstance(event, FileDeletedEvent):
             file_path = Path(event.src_path)
+            if is_temporary_file(file_path):
+                return
             logger.info("Обнаружено удаление файла: %s", file_path)
             self.on_file_deleted(file_path)
 
@@ -122,12 +114,14 @@ class FileWatcherHandler(FileSystemEventHandler):
         dest_path = Path(event.dest_path)
 
         if isinstance(event, DirMovedEvent):
+            if is_temporary_file(src_path) or is_temporary_file(dest_path):
+                return
             if self.on_folder_moved:
                 logger.info("Обнаружено перемещение папки: %s -> %s", src_path, dest_path)
                 self.on_folder_moved(src_path, dest_path)
             return
 
-        if self.is_temporary_file(src_path) or self.is_temporary_file(dest_path):
+        if is_temporary_file(src_path) or is_temporary_file(dest_path):
             return
         if self.should_ignore_callback and (
             self.should_ignore_callback(src_path) or self.should_ignore_callback(dest_path)

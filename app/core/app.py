@@ -8,15 +8,18 @@ from typing import Optional
 from app import config
 from app.core.api_client import SyncAPIClient
 from app.core.command_poller import CommandPoller
-from app.core.file_utils import normalize_relative_path
+from app.core.file_utils import is_temporary_file, normalize_relative_path
 from app.core.logger import add_log_handler, configure_logging
 from app.core.namespace_constants import (
     INBOX_DIRNAME,
     PROTECTED_NAMESPACE_KINDS,
     PROTECTED_NAMESPACE_NAMES,
     TRASH_DIRNAME,
+    VAULT_ROOT_NAME,
+    VAULT_ROOT_KIND,
 )
 from app.core.sync import FileSync, SyncStrategy
+from app.core.sync.namespace_utils import build_namespace_path_index, flatten_namespace_list
 from app.core.uploader import FileUploader
 from app.core.watcher import FileWatcher
 from app.gui import WatcherGUI
@@ -41,7 +44,7 @@ class MindBuddyWatcher:
         self._ignored_folder_moves = set()
 
     def _build_services(self):
-        vault_name = self.gui.selected_folder.name if self.gui.selected_folder else ""
+        vault_name = VAULT_ROOT_NAME if self.gui.selected_folder else ""
         self.api_client = SyncAPIClient(
             base_url=config.API_BASE_URL,
             token=self.gui.token,
@@ -108,11 +111,17 @@ class MindBuddyWatcher:
         self.gui.log("Обнаружена новая связка токена и папки, запускаю первичную инициализацию синхронизации...")
         local_structure = self.file_sync.get_local_structure()
         remote_structure = self.api_client.get_files_server_structure()
-        local_files = self.file_sync._get_local_file_index()
-        remote_files = self.file_sync.flatten_namespace_list(remote_structure)
+        local_files = self.file_sync.get_local_file_index()
+        remote_files = flatten_namespace_list(remote_structure)
 
-        is_empty_local = len(local_files) == 0 and all(namespace.name in PROTECTED_NAMESPACE_NAMES for namespace in local_structure)
-        is_empty_remote = len(remote_files) == 0 and all(namespace.name in PROTECTED_NAMESPACE_NAMES for namespace in remote_structure)
+        is_empty_local = len(local_files) == 0 and all(
+            namespace.kind == VAULT_ROOT_KIND or namespace.name in PROTECTED_NAMESPACE_NAMES
+            for namespace in local_structure
+        )
+        is_empty_remote = len(remote_files) == 0 and all(
+            namespace.kind == VAULT_ROOT_KIND or namespace.name in PROTECTED_NAMESPACE_NAMES
+            for namespace in remote_structure
+        )
 
         if is_empty_local and is_empty_remote:
             self.gui.log("ПК и сервер пусты, пропускаю первичную инициализацию синхронизации...")
@@ -183,7 +192,7 @@ class MindBuddyWatcher:
                 self.gui.log(f"Ошибка удаления namespace на сервере: {namespace_path}")
 
         snapshot = self.gui.db.get_last_sync_snapshot()
-        namespace_by_path = self.file_sync._build_namespace_path_index(snapshot)
+        namespace_by_path = build_namespace_path_index(snapshot)
         prefix = f"{relative_prefix}/"
         for namespace_path in sorted(namespace_by_path.keys(), key=lambda path: path.count("/"), reverse=True):
             if namespace_path in attempted_paths:
@@ -204,7 +213,7 @@ class MindBuddyWatcher:
         if self.gui.db.has_folder_path(relative_prefix):
             return True
         snapshot = self.gui.db.get_last_sync_snapshot()
-        return relative_prefix in self.file_sync._build_namespace_path_index(snapshot)
+        return relative_prefix in build_namespace_path_index(snapshot)
 
     def should_ignore_file_event(self, file_path):
         """Возращает True, если событие должно быть игнорировано."""
@@ -238,6 +247,8 @@ class MindBuddyWatcher:
 
     def on_local_file_changed(self, file_path, event_type):
         """Обрабатывает локальные create/modify события и грузит файл на backend."""
+        if is_temporary_file(Path(file_path)):
+            return
         result = self.file_uploader.upload_file(file_path)
         status = result.get("status")
         relative_path = result.get("relative_path") or Path(file_path).name
@@ -249,6 +260,8 @@ class MindBuddyWatcher:
 
     def on_local_file_moved(self, src_path, dest_path):
         """Обрабатывает локальное переименование/перемещение файла."""
+        if is_temporary_file(Path(src_path)) or is_temporary_file(Path(dest_path)):
+            return
         try:
             old_relative_path = self._normalize_relative_path(src_path)
         except Exception:
@@ -314,7 +327,7 @@ class MindBuddyWatcher:
             return
 
         for file_path in dest_path.rglob("*"):
-            if not file_path.is_file():
+            if not file_path.is_file() or is_temporary_file(file_path):
                 continue
 
             suffix = file_path.relative_to(dest_path).as_posix()
@@ -333,8 +346,8 @@ class MindBuddyWatcher:
                     f"Ошибка перемещения файла {old_relative_path} -> {new_relative_path}: "
                     f"{result.get('message')}"
                 )
-        if self.file_sync:
-            self.file_sync._replace_folder_states_from_local()
+
+        self.file_sync.replace_folder_states_from_local()
         self.gui.log(f"Перемещена локальная папка: {old_prefix} -> {new_prefix}")
 
     def on_local_folder_deleted(self, folder_path):
@@ -378,7 +391,7 @@ class MindBuddyWatcher:
 
         self._delete_remote_namespaces_under_prefix(relative_prefix)
         self.gui.db.delete_folder_states_under_prefix(relative_prefix)
-        self.file_sync._replace_folder_states_from_local()
+        self.file_sync.replace_folder_states_from_local()
         self.gui.log(f"Удалена локальная папка: {relative_prefix}")
 
     def on_local_file_deleted(self, file_path):
@@ -386,6 +399,8 @@ class MindBuddyWatcher:
         if not self.gui.selected_folder:
             self.gui.log("Ошибка: папка не выбрана")
             self.gui.update_status("Ошибка конфигурации", "red")
+            return
+        if is_temporary_file(Path(file_path)):
             return
         try:
             relative_path = self._normalize_relative_path(file_path)
@@ -449,7 +464,7 @@ class MindBuddyWatcher:
                 self.gui.log("Связка уже инициализирована, запускаю синхронизацию после перезапуска...")
                 self.file_sync.sync_after_restart()
             
-            self.file_sync._replace_folder_states_from_local()
+            self.file_sync.replace_folder_states_from_local()
             self.gui.db.save_last_initialized_binding(current_binding["token"], current_binding["folder_path"])
 
             self.file_watcher = FileWatcher(

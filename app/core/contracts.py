@@ -1,17 +1,28 @@
 """Контракты синхронизации между watcher, backend и RN."""
 
+import enum
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
+
+from app.core.namespace_constants import VAULT_ROOT_NAME
 
 
 def _strip_vault_prefix(path: str) -> str:
     if not path:
         return ""
     normalized = path.replace("\\", "/")
-    if normalized.startswith("Trash/"):
-        return normalized
-    parts = normalized.split("/", 1)
-    return parts[1] if len(parts) > 1 else normalized
+    vault_prefix = f"{VAULT_ROOT_NAME}/"
+    if normalized == VAULT_ROOT_NAME:
+        return ""
+    if normalized.startswith(vault_prefix):
+        return normalized[len(vault_prefix):]
+    return normalized
+
+
+class SyncCommandAckStatus(enum.StrEnum):
+    ACKED = "acked"
+    FAILED = "failed"
+    PENDING = "pending"
 
 
 @dataclass

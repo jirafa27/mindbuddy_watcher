@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.core.api_client import SyncAPIClient
-from app.core.contracts import SyncCommand
-from app.core.database import SettingsDB
+from app.core.contracts import SyncCommand, SyncCommandAckStatus
+from app.core.db import SettingsDB
 from app.core.file_utils import compute_file_hash
 from app.core.namespace_constants import (
     INBOX_DIRNAME,
@@ -170,7 +170,7 @@ class CommandPoller:
             return
 
         if self.db.has_applied_command(command.command_id):
-            self.api_client.ack_command(command.command_id, status="already_applied")
+            self.api_client.ack_command(command.command_id, status=SyncCommandAckStatus.ACKED)
             return
 
         try:
@@ -184,10 +184,14 @@ class CommandPoller:
                 self._apply_upsert(command)
 
             self.db.save_applied_command(command.command_id, command.relative_path)
-            self.api_client.ack_command(command.command_id, status="applied")
+            self.api_client.ack_command(command.command_id, status=SyncCommandAckStatus.ACKED)
         except Exception as error:
             logger.error("Ошибка применения команды %s: %s", command.command_id, error, exc_info=True)
-            self.api_client.ack_command(command.command_id, status="failed", error_message=str(error))
+            self.api_client.ack_command(
+                command.command_id,
+                status=SyncCommandAckStatus.FAILED,
+                error_message=str(error),
+            )
 
     def _apply_delete(self, command: SyncCommand):
         if command.target_type == "namespace":

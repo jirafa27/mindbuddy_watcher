@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from app.core.contracts import NamespaceStructureItem, SyncCommand, UploadResult
+from app.core.contracts import NamespaceStructureItem, SyncCommand, SyncCommandAckStatus, UploadResult
 
 logger = logging.getLogger(__name__)
 
@@ -143,12 +143,17 @@ class SyncAPIClient:
     def ack_command(
         self,
         command_id: str,
-        status: str = "applied",
+        status: SyncCommandAckStatus = SyncCommandAckStatus.ACKED,
         error_message: Optional[str] = None,
     ) -> bool:
         """Подтверждает применение или провал команды."""
         normalized_command_id = int(command_id) if str(command_id).isdigit() else command_id
-        payload = {"command_ids": [normalized_command_id]}
+        payload: Dict[str, Any] = {
+            "command_id": normalized_command_id,
+            "status": status.value,
+        }
+        if error_message:
+            payload["error_message"] = error_message
 
         try:
             response = self.session.post(

@@ -6,7 +6,7 @@ from pathlib import Path
 import threading
 from typing import Dict, Optional
 
-from app.core.database import SettingsDB
+from app.core.db import SettingsDB
 from app.core.sync import SyncStrategy
 
 

@@ -3,8 +3,8 @@
 import logging
 from pathlib import Path
 
-from app.core.database import SettingsDB
-from app.core.file_utils import build_local_file_meta
+from app.core.db import SettingsDB
+from app.core.file_utils import build_local_file_meta, is_temporary_file
 
 logger = logging.getLogger(__name__)
 
@@ -17,17 +17,6 @@ class FileUploader:
         self.local_folder = Path(local_folder)
         self.db = db
 
-    @staticmethod
-    def is_temporary_file(file_path: Path) -> bool:
-        """Отфильтровывает временные файлы, которые не нужно синхронизировать."""
-        name = file_path.name
-        return (
-            name.startswith("~$")
-            or name.endswith(".tmp")
-            or name.endswith(".temp")
-            or name.startswith(".~")
-        )
-
     def upload_file(self, file_path, server_user_file_id=None):
         """Отправляет локальный файл на сервер"""
         file_path = Path(file_path)
@@ -35,7 +24,7 @@ class FileUploader:
             logger.error("Файл не существует: %s", file_path)
             return {"status": "failed", "message": "Файл не найден"}
 
-        if self.is_temporary_file(file_path):
+        if is_temporary_file(file_path):
             return {"status": "skipped", "message": "Временный файл игнорируется"}
 
         try:
