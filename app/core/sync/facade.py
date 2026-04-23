@@ -9,7 +9,18 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from app.core.api_client import SyncAPIClient
-from app.core.contracts import FileInfo, IndexedFileMeta, LocalFileMeta, NamespaceStructureItem
+from app.core.contracts import (
+    FileInfo,
+    IndexedFileMeta,
+    LocalFileMeta,
+    NamespaceStructureItem,
+    SyncMismatchItem,
+    SyncMismatchItemKind,
+    SyncMismatchReport,
+    SyncMismatchResolution,
+    SyncMismatchType,
+    SyncResolutionAction,
+)
 from app.core.db import SettingsDB
 from app.core.file_utils import (
     build_local_file_info,
@@ -21,6 +32,7 @@ from app.core.file_utils import (
 from app.core.namespace_constants import (
     INBOX_DIRNAME,
     INBOX_KIND,
+    PROTECTED_NAMESPACE_NAMES,
     REGULAR_KIND,
     VAULT_ROOT_NAME,
     VAULT_ROOT_KIND,
@@ -62,19 +74,594 @@ class FileSync:
             return TRASH_KIND
         return REGULAR_KIND
 
+    @staticmethod
+    def _has_prefix_path(path: str, prefix: str) -> bool:
+        return path == prefix or path.startswith(f"{prefix}/")
+
+    def _is_protected_namespace_path(self, relative_path: str) -> bool:
+        return relative_path in PROTECTED_NAMESPACE_NAMES
+
+    def _keep_top_level_paths(self, paths: List[str]) -> List[str]:
+        top_level_paths: List[str] = []
+        for path in sorted(paths, key=lambda item: (item.count("/"), item)):
+            if any(self._has_prefix_path(path, existing_path) for existing_path in top_level_paths):
+                continue
+            top_level_paths.append(path)
+        return top_level_paths
+
+    def _match_path_changed_file_mismatches(
+        self,
+        local_only_files: List[str],
+        remote_only_files: List[str],
+        local_files: Dict[str, LocalFileMeta],
+        remote_files: Dict[str, IndexedFileMeta],
+    ) -> tuple[List[SyncMismatchItem], List[str], List[str]]:
+        path_changed_items: List[SyncMismatchItem] = []
+        matched_local_paths: Set[str] = set()
+        remaining_remote_paths: Set[str] = set(remote_only_files)
+        local_file_states = {
+            state["relative_path"]: state
+            for state in self.db.get_all_file_states()
+        }
+        remote_only_by_file_id = {
+            remote_files[path].file_id: path
+            for path in remote_only_files
+            if remote_files[path].file_id is not None
+        }
+
+        def register_match(local_path: str, remote_path: str) -> None:
+            local_meta = local_files[local_path]
+            remote_meta = remote_files[remote_path]
+            path_changed_items.append(
+                SyncMismatchItem(
+                    path=local_path,
+                    item_kind=SyncMismatchItemKind.FILE,
+                    mismatch_type=SyncMismatchType.PATH_CHANGED,
+                    local_hash=local_meta.content_hash,
+                    remote_hash=remote_meta.content_hash,
+                    local_path=local_path,
+                    remote_path=remote_path,
+                )
+            )
+            matched_local_paths.add(local_path)
+            remaining_remote_paths.discard(remote_path)
+
+        for local_path in local_only_files:
+            local_state = local_file_states.get(local_path)
+            local_file_id = local_state.get("server_user_file_id") if local_state else None
+            if local_file_id is None:
+                continue
+            remote_path = remote_only_by_file_id.get(local_file_id)
+            if remote_path and remote_path in remaining_remote_paths:
+                register_match(local_path, remote_path)
+
+        for local_path in local_only_files:
+            if local_path in matched_local_paths:
+                continue
+            local_meta = local_files.get(local_path)
+            if local_meta is None:
+                continue
+            local_parent = Path(local_path).parent.as_posix()
+            candidates = [
+                remote_path
+                for remote_path in remaining_remote_paths
+                if remote_files[remote_path].content_hash == local_meta.content_hash
+                and Path(remote_path).parent.as_posix() == local_parent
+            ]
+            if len(candidates) == 1:
+                register_match(local_path, candidates[0])
+
+        remaining_local_only = [
+            path for path in local_only_files
+            if path not in matched_local_paths
+        ]
+        remaining_remote_only = [
+            path for path in remote_only_files
+            if path in remaining_remote_paths
+        ]
+        return path_changed_items, remaining_local_only, remaining_remote_only
+
+    def _match_path_changed_folder_mismatches(
+        self,
+        local_only_dirs: List[str],
+        remote_only_dirs: List[str],
+        remote_structure: List[NamespaceStructureItem],
+    ) -> tuple[List[SyncMismatchItem], List[str], List[str]]:
+        path_changed_items: List[SyncMismatchItem] = []
+        matched_local_paths: Set[str] = set()
+        top_local_only_dirs = self._keep_top_level_paths(local_only_dirs)
+        top_remote_only_dirs = self._keep_top_level_paths(remote_only_dirs)
+        remaining_remote_paths: Set[str] = set(top_remote_only_dirs)
+        local_folder_states = {
+            state["relative_path"]: state
+            for state in self.db.get_all_folder_states()
+        }
+        remote_namespace_by_path = build_namespace_path_index(remote_structure)
+        remote_top_by_namespace_id = {
+            namespace.id: path
+            for path, namespace in remote_namespace_by_path.items()
+            if path in remaining_remote_paths and namespace.id is not None
+        }
+
+        for local_path in top_local_only_dirs:
+            local_state = local_folder_states.get(local_path)
+            local_namespace_id = local_state.get("namespace_id") if local_state else None
+            if local_namespace_id is None:
+                continue
+            remote_path = remote_top_by_namespace_id.get(local_namespace_id)
+            if remote_path and remote_path in remaining_remote_paths:
+                path_changed_items.append(
+                    SyncMismatchItem(
+                        path=local_path,
+                        item_kind=SyncMismatchItemKind.FOLDER,
+                        mismatch_type=SyncMismatchType.PATH_CHANGED,
+                        local_path=local_path,
+                        remote_path=remote_path,
+                    )
+                )
+                matched_local_paths.add(local_path)
+                remaining_remote_paths.discard(remote_path)
+
+        remaining_local_only = [
+            path for path in top_local_only_dirs
+            if path not in matched_local_paths
+        ]
+        remaining_remote_only = [
+            path for path in top_remote_only_dirs
+            if path in remaining_remote_paths
+        ]
+        return path_changed_items, remaining_local_only, remaining_remote_only
+
+    def _filter_file_path_changes_covered_by_folder_changes(
+        self,
+        path_changed_files: List[SyncMismatchItem],
+        path_changed_dirs: List[SyncMismatchItem],
+    ) -> List[SyncMismatchItem]:
+        def relative_suffix(path: str, prefix: str) -> str:
+            if path == prefix:
+                return ""
+            return path[len(prefix) + 1:]
+
+        filtered_items: List[SyncMismatchItem] = []
+        for file_item in path_changed_files:
+            local_path = file_item.local_path or file_item.path
+            remote_path = file_item.remote_path or file_item.path
+            covered_by_folder_change = False
+
+            for folder_item in path_changed_dirs:
+                local_dir_path = folder_item.local_path or folder_item.path
+                remote_dir_path = folder_item.remote_path or folder_item.path
+                if not local_dir_path or not remote_dir_path:
+                    continue
+                if not self._has_prefix_path(local_path, local_dir_path):
+                    continue
+                if not self._has_prefix_path(remote_path, remote_dir_path):
+                    continue
+                if relative_suffix(local_path, local_dir_path) == relative_suffix(remote_path, remote_dir_path):
+                    covered_by_folder_change = True
+                    break
+
+            if not covered_by_folder_change:
+                filtered_items.append(file_item)
+
+        return filtered_items
+
+    def build_sync_mismatch_report(
+        self,
+        remote_structure: Optional[List[NamespaceStructureItem]] = None,
+    ) -> SyncMismatchReport:
+        if remote_structure is None:
+            remote_structure = self.api_client.get_files_server_structure()
+
+        remote_files_dict = build_comparison_dict(flatten_namespace_list(remote_structure))
+        local_files_dict = build_comparison_dict(self.get_local_file_index())
+        dir_local_paths = get_namespace_paths(self.get_local_structure())
+        dir_remote_paths = get_namespace_paths(remote_structure)
+
+        local_only_files = sorted(
+            path
+            for path in set(local_files_dict) - set(remote_files_dict)
+            if not self._is_protected_namespace_path(path)
+        )
+        remote_only_files = sorted(
+            path
+            for path in set(remote_files_dict) - set(local_files_dict)
+            if not self._is_protected_namespace_path(path)
+        )
+        path_changed_files, local_only_files, remote_only_files = self._match_path_changed_file_mismatches(
+            local_only_files,
+            remote_only_files,
+            self.get_local_file_index(),
+            flatten_namespace_list(remote_structure),
+        )
+        changed_files = sorted(
+            path
+            for path in set(local_files_dict) & set(remote_files_dict)
+            if local_files_dict[path] != remote_files_dict[path]
+            and not self._is_protected_namespace_path(path)
+        )
+        local_only_dirs = sorted(
+            path
+            for path in dir_local_paths - dir_remote_paths
+            if path and not self._is_protected_namespace_path(path)
+        )
+        remote_only_dirs = sorted(
+            path
+            for path in dir_remote_paths - dir_local_paths
+            if path and not self._is_protected_namespace_path(path)
+        )
+        path_changed_dirs, local_only_dirs, remote_only_dirs = self._match_path_changed_folder_mismatches(
+            local_only_dirs,
+            remote_only_dirs,
+            remote_structure,
+        )
+        path_changed_files = self._filter_file_path_changes_covered_by_folder_changes(
+            path_changed_files,
+            path_changed_dirs,
+        )
+
+        mismatched_file_paths = set(local_only_files) | set(remote_only_files) | set(changed_files)
+        for item in path_changed_files:
+            if item.local_path:
+                mismatched_file_paths.add(item.local_path)
+            if item.remote_path:
+                mismatched_file_paths.add(item.remote_path)
+
+        items: List[SyncMismatchItem] = []
+        for item in path_changed_files:
+            items.append(item)
+        for path in local_only_files:
+            items.append(SyncMismatchItem(
+                path=path,
+                item_kind=SyncMismatchItemKind.FILE,
+                mismatch_type=SyncMismatchType.LOCAL_ONLY,
+                local_hash=local_files_dict.get(path),
+                local_path=path,
+            ))
+        for path in remote_only_files:
+            items.append(SyncMismatchItem(
+                path=path,
+                item_kind=SyncMismatchItemKind.FILE,
+                mismatch_type=SyncMismatchType.REMOTE_ONLY,
+                remote_hash=remote_files_dict.get(path),
+                remote_path=path,
+            ))
+        for path in changed_files:
+            items.append(SyncMismatchItem(
+                path=path,
+                item_kind=SyncMismatchItemKind.FILE,
+                mismatch_type=SyncMismatchType.CONTENT_DIFF,
+                local_hash=local_files_dict.get(path),
+                remote_hash=remote_files_dict.get(path),
+                local_path=path,
+                remote_path=path,
+            ))
+
+        for item in path_changed_dirs:
+            items.append(item)
+
+        folder_candidates = [
+            (SyncMismatchType.LOCAL_ONLY, path)
+            for path in local_only_dirs
+        ] + [
+            (SyncMismatchType.REMOTE_ONLY, path)
+            for path in remote_only_dirs
+        ]
+        for mismatch_type, path in sorted(folder_candidates, key=lambda item: item[1]):
+            if any(self._has_prefix_path(file_path, path) for file_path in mismatched_file_paths):
+                continue
+            items.append(SyncMismatchItem(
+                path=path,
+                item_kind=SyncMismatchItemKind.FOLDER,
+                mismatch_type=mismatch_type,
+            ))
+
+        return SyncMismatchReport(
+            items=sorted(items, key=lambda item: (item.item_kind.value, item.path)),
+        )
+
+    @staticmethod
+    def _log_sync_mismatch_report(report: SyncMismatchReport) -> None:
+        path_changed_files = [
+            (item.local_path or item.path, item.remote_path or item.path)
+            for item in report.items
+            if item.item_kind == SyncMismatchItemKind.FILE
+            and item.mismatch_type == SyncMismatchType.PATH_CHANGED
+        ]
+        path_changed_dirs = [
+            (item.local_path or item.path, item.remote_path or item.path)
+            for item in report.items
+            if item.item_kind == SyncMismatchItemKind.FOLDER
+            and item.mismatch_type == SyncMismatchType.PATH_CHANGED
+        ]
+        local_only_files = [item.path for item in report.items if item.item_kind == SyncMismatchItemKind.FILE and item.mismatch_type == SyncMismatchType.LOCAL_ONLY]
+        remote_only_files = [item.path for item in report.items if item.item_kind == SyncMismatchItemKind.FILE and item.mismatch_type == SyncMismatchType.REMOTE_ONLY]
+        changed_files = [item.path for item in report.items if item.item_kind == SyncMismatchItemKind.FILE and item.mismatch_type == SyncMismatchType.CONTENT_DIFF]
+        local_only_dirs = [item.path for item in report.items if item.item_kind == SyncMismatchItemKind.FOLDER and item.mismatch_type == SyncMismatchType.LOCAL_ONLY]
+        remote_only_dirs = [item.path for item in report.items if item.item_kind == SyncMismatchItemKind.FOLDER and item.mismatch_type == SyncMismatchType.REMOTE_ONLY]
+
+        if path_changed_files:
+            logger.warning("Файлы с разным путём/именем: %s", path_changed_files)
+        if path_changed_dirs:
+            logger.warning("Папки с разным путём/именем: %s", path_changed_dirs)
+        if local_only_files:
+            logger.warning("Только локальные файлы: %s", local_only_files)
+        if remote_only_files:
+            logger.warning("Только серверные файлы: %s", remote_only_files)
+        if changed_files:
+            logger.warning("Файлы с разным content_hash: %s", changed_files)
+        if local_only_dirs:
+            logger.warning("Только локальные папки: %s", local_only_dirs)
+        if remote_only_dirs:
+            logger.warning("Только серверные папки: %s", remote_only_dirs)
+
+    def apply_sync_mismatch_resolutions(
+        self,
+        resolutions: List[SyncMismatchResolution],
+    ) -> None:
+        remote_structure = self.api_client.get_files_server_structure()
+        remote_files = flatten_namespace_list(remote_structure)
+
+        file_resolutions = [
+            resolution
+            for resolution in resolutions
+            if resolution.item_kind == SyncMismatchItemKind.FILE
+        ]
+        folder_resolutions = [
+            resolution
+            for resolution in resolutions
+            if resolution.item_kind == SyncMismatchItemKind.FOLDER
+        ]
+
+        for resolution in file_resolutions:
+            local_path = resolution.local_path or resolution.path
+            remote_path = resolution.remote_path or resolution.path
+            remote_meta = remote_files.get(remote_path)
+            if resolution.action == SyncResolutionAction.SKIP:
+                continue
+            if resolution.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                if resolution.action == SyncResolutionAction.USE_LOCAL:
+                    if not local_path:
+                        logger.warning("Не указан локальный путь для path_changed")
+                        continue
+                    if remote_meta and remote_meta.file_id:
+                        local_parent = Path(local_path).parent.as_posix()
+                        remote_parent = Path(remote_path).parent.as_posix()
+                        if local_parent == remote_parent:
+                            rename_ok = self.api_client.rename_server_file(
+                                remote_meta.file_id,
+                                Path(local_path).name,
+                            )
+                            if not rename_ok:
+                                logger.warning(
+                                    "Не удалось переименовать серверную версию файла %s -> %s",
+                                    remote_path,
+                                    local_path,
+                                )
+                                continue
+                            if (
+                                resolution.local_hash
+                                and resolution.remote_hash
+                                and resolution.local_hash != resolution.remote_hash
+                            ):
+                                result = self.upload_local_file(
+                                    local_path,
+                                    server_user_file_id=remote_meta.file_id,
+                                )
+                                if result.get("status") not in {"uploaded", "skipped"}:
+                                    logger.warning(
+                                        "Не удалось обновить серверное содержимое файла %s: %s",
+                                        local_path,
+                                        result.get("message"),
+                                    )
+                                    continue
+                            logger.info(
+                                "Расхождение по пути файла разрешено в пользу ПК: %s -> %s",
+                                remote_path,
+                                local_path,
+                            )
+                            continue
+
+                        if not self.api_client.delete_server_file(remote_meta.file_id):
+                            logger.warning("Не удалось удалить серверную версию файла %s", remote_path)
+                            continue
+                    result = self.upload_local_file(local_path)
+                    if result.get("status") in {"uploaded", "skipped"}:
+                        logger.info(
+                            "Расхождение по пути файла разрешено в пользу ПК: %s -> %s",
+                            remote_path,
+                            local_path,
+                        )
+                    else:
+                        logger.warning(
+                            "Не удалось применить локальную версию файла %s: %s",
+                            local_path,
+                            result.get("message"),
+                        )
+                    continue
+
+                if remote_meta is None:
+                    logger.warning("Не удалось найти серверную версию файла для %s", remote_path)
+                    continue
+                if local_path and local_path != remote_path:
+                    if not self.delete_local_file(local_path):
+                        logger.warning(
+                            "Не удалось удалить локальную версию файла перед заменой: %s",
+                            local_path,
+                        )
+                        continue
+                action = self.apply_remote_file_state(remote_meta)
+                if action != "failed":
+                    logger.info(
+                        "Расхождение по пути файла разрешено в пользу сервера: %s -> %s",
+                        local_path,
+                        remote_path,
+                    )
+                else:
+                    logger.warning("Не удалось применить серверную версию файла %s", remote_path)
+                continue
+
+            if resolution.action == SyncResolutionAction.USE_LOCAL:
+                if resolution.mismatch_type == SyncMismatchType.REMOTE_ONLY:
+                    if remote_meta and remote_meta.file_id and self.api_client.delete_server_file(remote_meta.file_id):
+                        remote_files.pop(remote_path, None)
+                        logger.info("Расхождение по файлу разрешено в пользу ПК: %s", remote_path)
+                    else:
+                        logger.warning("Не удалось удалить серверную версию файла %s", remote_path)
+                    continue
+
+                self.db.delete_file_state(local_path)
+                if remote_meta is None:
+                    result = self.upload_local_file(local_path)
+                else:
+                    result = self.upload_local_file(
+                        local_path,
+                        server_user_file_id=remote_meta.file_id,
+                    )
+                if result.get("status") == "uploaded":
+                    logger.info("Расхождение по файлу разрешено в пользу ПК: %s", local_path)
+                else:
+                    logger.warning("Не удалось применить локальную версию файла %s: %s", local_path, result.get("message"))
+                continue
+
+            if resolution.mismatch_type == SyncMismatchType.LOCAL_ONLY:
+                if self.delete_local_file(local_path):
+                    logger.info("Расхождение по файлу разрешено в пользу сервера: %s", local_path)
+                else:
+                    logger.warning("Не удалось удалить локальную версию файла %s", local_path)
+                continue
+
+            if resolution.action == SyncResolutionAction.USE_REMOTE:
+                action = self.apply_remote_file_state(remote_meta)
+                if action != "failed":
+                    logger.info("Расхождение по файлу разрешено в пользу сервера: %s", remote_path)
+                else:
+                    logger.warning("Не удалось применить серверную версию файла %s", remote_path)
+                continue
+
+        for resolution in folder_resolutions:
+            if resolution.action == SyncResolutionAction.SKIP:
+                continue
+            local_path = resolution.local_path or resolution.path
+            remote_path = resolution.remote_path or resolution.path
+            local_namespace_paths = get_namespace_paths(self.get_local_structure())
+            remote_namespace_paths = get_namespace_paths(remote_structure)
+            local_subtree_paths = {
+                path
+                for path in local_namespace_paths
+                if self._has_prefix_path(path, local_path)
+            }
+            remote_subtree_paths = {
+                path
+                for path in remote_namespace_paths
+                if self._has_prefix_path(path, remote_path)
+            }
+            if resolution.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                remote_namespace = build_namespace_path_index(remote_structure).get(remote_path)
+                if resolution.action == SyncResolutionAction.USE_REMOTE:
+                    if self._move_local_namespace(local_path, remote_path):
+                        logger.info(
+                            "Расхождение по пути папки разрешено в пользу сервера: %s -> %s",
+                            local_path,
+                            remote_path,
+                        )
+                    else:
+                        logger.warning("Не удалось применить серверную версию папки %s", remote_path)
+                    continue
+
+                if remote_namespace is None or remote_namespace.id is None:
+                    logger.warning("Не удалось найти серверный namespace для %s", remote_path)
+                    continue
+                local_parent_path = Path(local_path).parent.as_posix()
+                remote_parent_path = Path(remote_path).parent.as_posix()
+                sync_ok = True
+                if local_parent_path != remote_parent_path:
+                    remote_namespace_by_path = build_namespace_path_index(remote_structure)
+                    if local_parent_path in {".", ""}:
+                        target_parent = next(
+                            (namespace for namespace in remote_structure if namespace.kind == VAULT_ROOT_KIND and namespace.id is not None),
+                            None,
+                        )
+                    else:
+                        target_parent = remote_namespace_by_path.get(local_parent_path)
+                    if not (target_parent and target_parent.id is not None and self.api_client.move_namespace(remote_namespace.id, target_parent.id)):
+                        logger.warning(
+                            "Не удалось применить локальное перемещение папки %s -> %s",
+                            remote_path,
+                            local_path,
+                        )
+                        sync_ok = False
+
+                if sync_ok and Path(local_path).name != Path(remote_path).name:
+                    if not self.api_client.rename_namespace(remote_namespace.id, Path(local_path).name):
+                        logger.warning(
+                            "Не удалось применить локальное переименование папки %s -> %s",
+                            remote_path,
+                            local_path,
+                        )
+                        sync_ok = False
+
+                if sync_ok:
+                    logger.info(
+                        "Расхождение по пути папки разрешено в пользу ПК: %s -> %s",
+                        remote_path,
+                        local_path,
+                    )
+                continue
+
+            if resolution.action == SyncResolutionAction.USE_LOCAL:
+                if resolution.mismatch_type == SyncMismatchType.REMOTE_ONLY:
+                    deleted = self.delete_remote_namespaces(remote_subtree_paths, remote_structure)
+                    if deleted:
+                        logger.info("Расхождение по папке разрешено в пользу ПК: %s", remote_path)
+                    else:
+                        logger.warning("Не удалось удалить серверную версию папки %s", remote_path)
+                elif self.create_remote_namespace_tree(local_subtree_paths, remote_structure):
+                    logger.info("Расхождение по папке разрешено в пользу ПК: %s", local_path)
+                else:
+                    logger.warning("Не удалось применить локальную версию папки %s", local_path)
+                continue
+
+            if resolution.action == SyncResolutionAction.USE_REMOTE:
+                if resolution.mismatch_type == SyncMismatchType.REMOTE_ONLY:
+                    created_any = False
+                    for namespace_path in sorted(remote_subtree_paths, key=lambda path: (path.count("/"), path)):
+                        created_any = self.create_local_folder_if_not_exists(namespace_path) or created_any
+                    if created_any:
+                        logger.info("Расхождение по папке разрешено в пользу сервера: %s", remote_path)
+                    else:
+                        logger.info("Папка уже существует локально после выбора серверной версии: %s", remote_path)
+                else:
+                    deleted_all = True
+                    for namespace_path in sorted(local_subtree_paths, key=lambda path: (path.count("/"), path), reverse=True):
+                        if not self.delete_local_namespace_if_empty(namespace_path):
+                            deleted_all = False
+                    if deleted_all:
+                        logger.info("Расхождение по папке разрешено в пользу сервера: %s", local_path)
+                    else:
+                        logger.warning("Не удалось удалить локальную версию папки %s", local_path)
+                        continue
+
+        self.replace_folder_states_from_local()
+
     # Хелперы состояния папок
     def replace_folder_states_from_local(self) -> None:
         local_paths = get_namespace_paths(self.get_local_structure())
+        existing_folder_states = {
+            state["relative_path"]: state
+            for state in self.db.get_all_folder_states()
+        }
         folder_states: List[Dict[str, object]] = []
         for relative_path in sorted(local_paths, key=lambda path: (path.count("/"), path)):
             parent_path = Path(relative_path).parent.as_posix()
+            existing_state = existing_folder_states.get(relative_path, {})
             folder_states.append({
                 "relative_path": relative_path,
-                "namespace_id": None,
+                "namespace_id": existing_state.get("namespace_id"),
                 "parent_relative_path": None if parent_path in {".", ""} else parent_path,
-                "kind": self._folder_kind_from_path(relative_path),
-                "is_applying_remote": False,
-                "last_command_id": None,
+                "kind": existing_state.get("kind") or self._folder_kind_from_path(relative_path),
+                "is_applying_remote": existing_state.get("is_applying_remote", False),
+                "last_command_id": existing_state.get("last_command_id"),
             })
         self.db.replace_folder_states(folder_states)
 
@@ -235,13 +822,32 @@ class FileSync:
         """Создаёт на сервере отсутствующие namespace по путям."""
         created = 0
         namespace_by_path = build_namespace_path_index(remote_structure)
+        vault_root_namespace = next(
+            (
+                namespace
+                for namespace in remote_structure
+                if namespace.kind == VAULT_ROOT_KIND and namespace.id is not None
+            ),
+            None,
+        )
 
         for namespace_path in sorted(namespace_paths, key=lambda path: (path.count("/"), path)):
             if not namespace_path or namespace_path in {INBOX_DIRNAME, TRASH_DIRNAME} or namespace_path in namespace_by_path:
                 continue
 
+            parent_path = Path(namespace_path).parent.as_posix()
+            if parent_path in {".", ""}:
+                parent_namespace_id = vault_root_namespace.id if vault_root_namespace else None
+            else:
+                parent_namespace = namespace_by_path.get(parent_path)
+                parent_namespace_id = parent_namespace.id if parent_namespace and parent_namespace.id is not None else None
+            if parent_namespace_id is None:
+                logger.warning("Не удалось определить parent namespace для %s", namespace_path)
+                continue
+
             created_namespace = self.api_client.create_namespace(
-                relative_path=namespace_path,
+                name=Path(namespace_path).name,
+                parent_namespace_id=parent_namespace_id,
             )
             if created_namespace is None:
                 logger.warning(f"Не удалось создать namespace на сервере: {namespace_path}")
@@ -249,7 +855,6 @@ class FileSync:
 
             remote_structure.append(created_namespace)
             namespace_by_path[namespace_path] = created_namespace
-            parent_path = Path(namespace_path).parent.as_posix()
             self.db.upsert_folder_state(
                 namespace_path,
                 namespace_id=created_namespace.id,
@@ -363,20 +968,19 @@ class FileSync:
         self._mark_remote_paths(relative_path, is_remote=True)
 
         try:
-            downloaded = False
             file_id = remote_meta.file_id
-            if file_id:
-                downloaded = self.api_client.download_file_by_id(file_id, target_path)
-            if not downloaded:
-                downloaded = self.api_client.download_file(
-                    relative_path=relative_path,
-                    destination=target_path,
-                    download_url=None,
-                )
+            if not file_id:
+                logger.warning("Не удалось скачать файл без user_file_id: %s", relative_path)
+                return False
+            downloaded = self.api_client.download_file_by_id(file_id, target_path)
             if not downloaded:
                 return False
 
             self._remember_parent_folders(relative_path, namespace_id=remote_meta.namespace_id)
+            self.db.delete_file_states_by_server_user_file_id(
+                file_id,
+                keep_relative_path=relative_path,
+            )
             self.db.upsert_file_state(
                 relative_path,
                 content_hash=compute_file_hash(target_path),
@@ -405,6 +1009,25 @@ class FileSync:
         old_path.rename(new_path)
         self._prune_empty_parents(old_path.parent, self.local_folder)
         self.replace_folder_states_from_local()
+
+    def _move_local_namespace(self, old_relative_path: str, new_relative_path: str) -> bool:
+        if old_relative_path == new_relative_path:
+            return True
+
+        old_path = self.local_folder / old_relative_path
+        new_path = self.local_folder / new_relative_path
+        if not old_path.exists() or not old_path.is_dir():
+            return False
+        if new_path.exists() and new_path != old_path:
+            return False
+
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        old_path.rename(new_path)
+        self.db.rename_folder_prefix(old_relative_path, new_relative_path)
+        self.db.rename_file_prefix(old_relative_path, new_relative_path)
+        self._prune_empty_parents(old_path.parent, self.local_folder)
+        self.replace_folder_states_from_local()
+        return True
 
     def delete_local_file(self, relative_path: str) -> bool:
         target_path = self.local_folder / relative_path
@@ -477,55 +1100,33 @@ class FileSync:
                 shutil.rmtree(child)
             else:
                 child.unlink()
+        self.db.clear_sync_data()
 
-    def refresh_last_sync_snapshot_if_synced(self):
+    def refresh_last_sync_snapshot_if_synced(self) -> Optional[SyncMismatchReport]:
         """Проверяет, что сервер и ПК синхронизированы и обновляет last_sync_snapshot."""
         remote_structure = self.api_client.get_files_server_structure()
+        mismatch_report = self.build_sync_mismatch_report(remote_structure)
 
-        remote_files_dict = build_comparison_dict(flatten_namespace_list(remote_structure))
-        local_files_dict = build_comparison_dict(self.get_local_file_index())
-
-        dir_local_paths = get_namespace_paths(self.get_local_structure())
-        dir_remote_paths = get_namespace_paths(remote_structure)
-
-        if local_files_dict != remote_files_dict or dir_local_paths != dir_remote_paths:
+        if not mismatch_report.is_empty():
             logger.warning("ПК и сервер не синхронизированы, пропускаю обновление last_sync_snapshot")
-            local_only_files = sorted(set(local_files_dict) - set(remote_files_dict))
-            remote_only_files = sorted(set(remote_files_dict) - set(local_files_dict))
-            changed_files = sorted(
-                path
-                for path in set(local_files_dict) & set(remote_files_dict)
-                if local_files_dict[path] != remote_files_dict[path]
-            )
-            local_only_dirs = sorted(dir_local_paths - dir_remote_paths)
-            remote_only_dirs = sorted(dir_remote_paths - dir_local_paths)
-
-            if local_only_files:
-                logger.warning("Только локальные файлы: %s", local_only_files)
-            if remote_only_files:
-                logger.warning("Только серверные файлы: %s", remote_only_files)
-            if changed_files:
-                logger.warning("Файлы с разным content_hash: %s", changed_files)
-            if local_only_dirs:
-                logger.warning("Только локальные папки: %s", local_only_dirs)
-            if remote_only_dirs:
-                logger.warning("Только серверные папки: %s", remote_only_dirs)
-            return
+            self._log_sync_mismatch_report(mismatch_report)
+            return mismatch_report
 
         logger.info("ПК и сервер синхронизированы, обновляю last_sync_snapshot...")
         self.db.save_last_sync_snapshot(remote_structure)
         self._replace_folder_states_from_remote(remote_structure)
+        return None
 
     # Высокоуровневые сценарии синхронизации
     def initial_sync(
         self,
         strategy: Optional[SyncStrategy] = None,
-    ) -> None:
+    ) -> Optional[SyncMismatchReport]:
         """Первичная инициализация связки token + folder."""
-        run_initial_sync(self, strategy)
+        return run_initial_sync(self, strategy)
 
-    def sync_after_restart(self) -> None:
+    def sync_after_restart(self) -> Optional[SyncMismatchReport]:
         """
         Сверяет ПК и сервер относительно last_sync_snapshot после простоя watcher.
         """
-        RestartSyncRunner(self).run()
+        return RestartSyncRunner(self).run()

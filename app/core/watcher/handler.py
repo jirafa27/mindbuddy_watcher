@@ -16,6 +16,7 @@ class FileWatcherHandler(FileSystemEventHandler):
     def __init__(
         self,
         on_file_changed_callback=None,
+        on_folder_created_callback=None,
         on_file_deleted_callback=None,
         on_file_moved_callback=None,
         on_folder_moved_callback=None,
@@ -25,6 +26,7 @@ class FileWatcherHandler(FileSystemEventHandler):
     ):
         super().__init__()
         self.on_file_changed = on_file_changed_callback
+        self.on_folder_created = on_folder_created_callback
         self.on_file_deleted = on_file_deleted_callback
         self.on_file_moved = on_file_moved_callback
         self.on_folder_moved = on_folder_moved_callback
@@ -73,6 +75,11 @@ class FileWatcherHandler(FileSystemEventHandler):
             return
 
         if self.should_ignore_callback and self.should_ignore_callback(file_path):
+            return
+
+        if event_type == "create_folder" and file_path.exists() and file_path.is_dir() and self.on_folder_created:
+            logger.info("Обнаружено событие %s для папки: %s", event_type, file_path)
+            self.on_folder_created(file_path)
             return
 
         if file_path.exists() and file_path.is_file() and self.on_file_changed:

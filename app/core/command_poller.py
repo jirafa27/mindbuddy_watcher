@@ -1,6 +1,5 @@
 """Polling-компонент для применения серверных команд локально на ПК."""
 
-import base64
 import logging
 import shutil
 import threading
@@ -9,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from app.core.api_client import SyncAPIClient
-from app.core.contracts import SyncCommand, SyncCommandAckStatus
+from app.core.contracts import SyncCommand, SyncCommandAckStatus, SyncCommandType
 from app.core.db import SettingsDB
 from app.core.file_utils import compute_file_hash
 from app.core.namespace_constants import (
@@ -19,14 +18,9 @@ from app.core.namespace_constants import (
     TRASH_DIRNAME,
     TRASH_KIND,
 )
+from app.core.sync.namespace_utils import build_path_by_namespace_id, flatten_namespace_list
 
 logger = logging.getLogger(__name__)
-
-
-_DELETE_TYPES = {"delete", "delete_file", "remove_file"}
-_RENAME_TYPES = {"rename", "rename_file"}
-_MOVE_TYPES = {"move", "move_file"}
-_TRASH_TYPES = {"trash", "trash_file"}
 
 
 class CommandPoller:
@@ -58,16 +52,35 @@ class CommandPoller:
         """Останавливает polling-цикл."""
         self._stop_event.set()
 
+    def _process_pending_command_batch(self) -> int:
+        commands = self.api_client.get_pending_commands(limit=self.batch_size)
+        for command in commands:
+            if self._stop_event.is_set():
+                break
+            self._apply_command(command)
+        return len(commands)
+
+    def drain_pending_commands(self, log_empty: bool = False) -> int:
+        """Применяет все накопившиеся pending-команды до опустошения очереди."""
+        total_commands = 0
+        while not self._stop_event.is_set():
+            batch_count = self._process_pending_command_batch()
+            total_commands += batch_count
+            if batch_count == 0 or batch_count < self.batch_size:
+                break
+
+        if total_commands > 0:
+            self.log(f"Применены накопившиеся серверные команды: {total_commands}")
+        elif log_empty:
+            self.log("Накопившихся серверных команд нет")
+
+        return total_commands
+
     def run_forever(self):
         """Основной цикл опроса команд сервера."""
         self.log("Polling команд синхронизации запущен")
         while not self._stop_event.is_set():
-            commands = self.api_client.get_pending_commands(limit=self.batch_size)
-            for command in commands:
-                if self._stop_event.is_set():
-                    break
-                self._apply_command(command)
-
+            self.drain_pending_commands()
             self._stop_event.wait(self.poll_interval)
 
         self.log("Polling команд синхронизации остановлен")
@@ -106,8 +119,6 @@ class CommandPoller:
             file_state = self.db.get_file_state_by_server_user_file_id(command.file_id)
             if file_state:
                 return file_state["relative_path"]
-        if command.old_relative_path:
-            return command.old_relative_path
         return None
 
     def _mark_file_paths_remote_apply(self, *relative_paths: Optional[str], is_remote: bool):
@@ -118,6 +129,93 @@ class CommandPoller:
         for relative_path in {path for path in relative_paths if path}:
             self.db.mark_folder_remote_apply(relative_path, is_remote)
 
+    def _resolve_namespace_local_path(self, namespace_id: int) -> Optional[str]:
+        """Находит локальный путь пространства по его ID."""
+        for folder_state in self.db.get_all_folder_states():
+            if folder_state.get("namespace_id") == namespace_id:
+                return folder_state["relative_path"]
+
+        last_snapshot = self.db.get_last_sync_snapshot()
+        path_by_namespace_id = build_path_by_namespace_id(last_snapshot)
+        if namespace_id in path_by_namespace_id:
+            return path_by_namespace_id[namespace_id]
+        return None
+
+    def _resolve_server_relative_path_by_file_id(self, file_id: int) -> Optional[str]:
+        """Запрашивает у сервера актуальный relative_path файла по его user_file_id."""
+        try:
+            remote_structure = self.api_client.get_files_server_structure()
+        except Exception as error:
+            logger.warning(
+                "Не удалось получить live server structure для file_id=%s: %s",
+                file_id,
+                error,
+            )
+            return None
+
+        for relative_path, remote_meta in flatten_namespace_list(remote_structure).items():
+            if remote_meta.file_id == file_id:
+                return relative_path
+        return None
+
+    def _build_target_file_relative_path(
+        self,
+        filename: str,
+        target_namespace_id: int,
+    ) -> str:
+        """Создает относительный путь файла в пространстве по его имени и ID пространства."""
+        target_namespace_path = self._resolve_namespace_local_path(target_namespace_id)
+        if target_namespace_path is None:
+            raise RuntimeError(
+                f"Не удалось найти локальное пространство для target_namespace_id={target_namespace_id}"
+            )
+        return f"{target_namespace_path}/{filename}" if target_namespace_path else filename
+
+    def _build_target_namespace_relative_path(
+        self,
+        namespace_id: int,
+        target_parent_id: int,
+    ) -> tuple[str, str]:
+        current_namespace_path = self._resolve_namespace_local_path(namespace_id)
+        if current_namespace_path is None:
+            raise RuntimeError(f"Не удалось найти локальную папку для namespace_id={namespace_id}")
+        if not current_namespace_path:
+            raise RuntimeError("Нельзя перемещать корневой namespace")
+
+        target_parent_path = self._resolve_namespace_local_path(target_parent_id)
+        if target_parent_path is None:
+            raise RuntimeError(
+                f"Не удалось найти локальный parent namespace для target_parent_id={target_parent_id}"
+            )
+
+        namespace_name = Path(current_namespace_path).name
+        target_namespace_path = (
+            f"{target_parent_path}/{namespace_name}"
+            if target_parent_path
+            else namespace_name
+        )
+        return current_namespace_path, target_namespace_path
+
+    def _resolve_upsert_target_relative_path(
+        self,
+        command: SyncCommand,
+        existing_relative_path: Optional[str],
+    ) -> str:
+        if command.namespace_id is not None and command.filename:
+            return self._build_target_file_relative_path(command.filename, command.namespace_id)
+        if command.file_id is not None:
+            server_relative_path = self._resolve_server_relative_path_by_file_id(command.file_id)
+            if server_relative_path:
+                return server_relative_path
+        if command.relative_path:
+            return command.relative_path
+        if existing_relative_path:
+            return existing_relative_path
+        raise RuntimeError(
+            "Для upsert_file не указан путь файла: ожидается связка "
+            "namespace_id + filename, live server path или уже известный local state"
+        )
+
     def _set_remote_apply_for_subtree(self, subtree_root_path: str, is_remote: bool):
         self._mark_folder_paths_remote_apply(subtree_root_path, is_remote=is_remote)
         for folder_state in self.db.get_folder_states_under_prefix(subtree_root_path):
@@ -125,28 +223,14 @@ class CommandPoller:
         for file_state in self.db.get_file_states_under_prefix(subtree_root_path):
             self.db.mark_file_remote_apply(file_state["relative_path"], is_remote)
 
-    def _write_command_content(self, command: SyncCommand, target_path: Path):
-        if command.content is not None:
-            target_path.write_text(command.content, encoding="utf-8")
-            return
-
-        if command.content_base64 is not None:
-            target_path.write_bytes(base64.b64decode(command.content_base64))
-            return
-
-        downloaded = False
-        if command.file_id:
-            downloaded = self.api_client.download_file_by_id(command.file_id, target_path)
-        if not downloaded:
-            downloaded = self.api_client.download_file(
-                command.relative_path,
-                target_path,
-                download_url=command.download_url,
-            )
-        if not downloaded:
-            raise RuntimeError(f"Не удалось скачать {command.relative_path}")
+    def _download_file_for_command(self, command: SyncCommand, target_path: Path) -> None:
+        if command.file_id is None:
+            raise RuntimeError("Для загрузки файла отсутствует user_file_id")
+        if not self.api_client.download_file_by_id(command.file_id, target_path):
+            raise RuntimeError(f"Не удалось скачать файл id={command.file_id}")
 
     def _update_file_state_from_disk(self, relative_path: str, target_path: Path, command: SyncCommand):
+        """Обновляет состояние файла в базе данных на основе данных с диска."""
         parent_path = Path(relative_path).parent.as_posix()
         if parent_path not in {".", ""}:
             self._ensure_folder_chain(
@@ -165,23 +249,68 @@ class CommandPoller:
             last_command_id=command.command_id,
         )
 
+    @staticmethod
+    def _ensure_file_relocation_applied(
+        old_path: Optional[Path],
+        new_path: Path,
+    ) -> None:
+        if not new_path.exists() or not new_path.is_file():
+            raise RuntimeError(f"Локальный файл не появился по целевому пути: {new_path}")
+        if old_path and old_path != new_path and old_path.exists():
+            raise RuntimeError(f"Исходный файл остался на старом пути: {old_path}")
+
+    @staticmethod
+    def _ensure_namespace_relocation_applied(
+        old_path: Path,
+        new_path: Path,
+    ) -> None:
+        if not new_path.exists() or not new_path.is_dir():
+            raise RuntimeError(f"Локальная папка не появилась по целевому пути: {new_path}")
+        if old_path != new_path and old_path.exists():
+            raise RuntimeError(f"Исходная папка осталась на старом пути: {old_path}")
+
     def _apply_command(self, command: SyncCommand):
-        if not command.command_id or not command.relative_path:
+        if not command.command_id:
             return
 
         if self.db.has_applied_command(command.command_id):
             self.api_client.ack_command(command.command_id, status=SyncCommandAckStatus.ACKED)
             return
 
+        if command.command_type is None:
+            message = f"Unsupported command type: {command.extra.get('unsupported_command_type') or 'unknown'}"
+            logger.warning(message)
+            self.api_client.ack_command(
+                command.command_id,
+                status=SyncCommandAckStatus.FAILED,
+                error_message=message,
+            )
+            return
+
         try:
-            if command.command_type in _DELETE_TYPES:
-                self._apply_delete(command)
-            elif command.command_type in _RENAME_TYPES or command.command_type in _MOVE_TYPES:
-                self._apply_rename_or_move(command)
-            elif command.command_type in _TRASH_TYPES:
-                self._apply_trash(command)
+            if command.command_type == SyncCommandType.UPSERT_FILE:
+                self._apply_upsert_file(command)
+            elif command.command_type == SyncCommandType.MOVE_FILE:
+                self._apply_move_file(command)
+            elif command.command_type == SyncCommandType.RENAME_FILE:
+                self._apply_rename_file(command)
+            elif command.command_type == SyncCommandType.TRASH_FILE:
+                self._apply_trash_file(command)
+            elif command.command_type == SyncCommandType.DELETE_NAMESPACE:
+                self._apply_delete_namespace(command)
+            elif command.command_type == SyncCommandType.MOVE_NAMESPACE:
+                self._apply_move_namespace(command)
+            elif command.command_type == SyncCommandType.RENAME_NAMESPACE:
+                self._apply_rename_namespace(command)
             else:
-                self._apply_upsert(command)
+                message = f"Unsupported command type: {command.command_type.value}"
+                logger.warning(message)
+                self.api_client.ack_command(
+                    command.command_id,
+                    status=SyncCommandAckStatus.FAILED,
+                    error_message=message,
+                )
+                return
 
             self.db.save_applied_command(command.command_id, command.relative_path)
             self.api_client.ack_command(command.command_id, status=SyncCommandAckStatus.ACKED)
@@ -193,22 +322,9 @@ class CommandPoller:
                 error_message=str(error),
             )
 
-    def _apply_delete(self, command: SyncCommand):
-        if command.target_type == "namespace":
-            self._apply_delete_namespace(command)
-            return
-
-        target_path = self.local_folder / command.relative_path
-        self._mark_file_paths_remote_apply(command.relative_path, is_remote=True)
-        try:
-            if target_path.exists():
-                target_path.unlink()
-            self.db.delete_file_state(command.relative_path)
-            self.log(f"Удален файл по команде сервера: {command.relative_path}")
-        finally:
-            self._mark_file_paths_remote_apply(command.relative_path, is_remote=False)
-
     def _apply_delete_namespace(self, command: SyncCommand):
+        if not command.relative_path:
+            raise RuntimeError("Для delete_namespace не указан relative_path")
         target_path = self.local_folder / command.relative_path
         self._set_remote_apply_for_subtree(command.relative_path, is_remote=True)
         try:
@@ -223,18 +339,12 @@ class CommandPoller:
         finally:
             self._set_remote_apply_for_subtree(command.relative_path, is_remote=False)
 
-    def _apply_rename_or_move(self, command: SyncCommand):
-        if command.target_type == "namespace":
-            self._apply_rename_or_move_namespace(command)
-            return
-        self._apply_rename_or_move_file(command)
-
-    def _apply_rename_or_move_file(self, command: SyncCommand):
-        old_relative_path = self._resolve_existing_relative_path(command)
-        new_relative_path = command.new_relative_path or command.relative_path
-        if not new_relative_path:
-            raise RuntimeError("Не указан новый путь для rename/move")
-
+    def _relocate_file(
+        self,
+        command: SyncCommand,
+        old_relative_path: Optional[str],
+        new_relative_path: str,
+    ) -> None:
         old_path = self.local_folder / old_relative_path if old_relative_path else None
         new_path = self.local_folder / new_relative_path
         self._mark_file_paths_remote_apply(old_relative_path, new_relative_path, is_remote=True)
@@ -242,30 +352,34 @@ class CommandPoller:
         try:
             new_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if old_path and old_path.exists() and old_path != new_path:
+            if not old_path or not old_path.exists():
+                if new_path.exists() and new_path.is_file():
+                    if old_relative_path and old_relative_path != new_relative_path:
+                        self.db.rename_file_state(old_relative_path, new_relative_path)
+                    self._update_file_state_from_disk(new_relative_path, new_path, command)
+                    self.log(f"Команда {command.command_type} уже была применена локально: {new_relative_path}")
+                    return
+                raise RuntimeError("Локальный файл для перемещения не найден")
+            if old_path != new_path:
                 if new_path.exists() and new_path != old_path:
                     new_path.unlink()
                 old_path.rename(new_path)
-            elif not new_path.exists():
-                self._write_command_content(command, new_path)
-
-            if command.content is not None or command.content_base64 is not None:
-                self._write_command_content(command, new_path)
 
             if old_relative_path and old_relative_path != new_relative_path:
                 self.db.rename_file_state(old_relative_path, new_relative_path)
 
+            self._ensure_file_relocation_applied(old_path, new_path)
             self._update_file_state_from_disk(new_relative_path, new_path, command)
             self.log(f"Применена команда {command.command_type}: {new_relative_path}")
         finally:
             self._mark_file_paths_remote_apply(old_relative_path, new_relative_path, is_remote=False)
 
-    def _apply_rename_or_move_namespace(self, command: SyncCommand):
-        old_relative_path = command.old_relative_path or command.relative_path
-        new_relative_path = command.new_relative_path or command.relative_path
-        if not old_relative_path or not new_relative_path:
-            raise RuntimeError("Не указан путь namespace для rename/move")
-
+    def _relocate_namespace(
+        self,
+        command: SyncCommand,
+        old_relative_path: str,
+        new_relative_path: str,
+    ) -> None:
         old_path = self.local_folder / old_relative_path
         new_path = self.local_folder / new_relative_path
         self._set_remote_apply_for_subtree(old_relative_path, is_remote=True)
@@ -274,10 +388,8 @@ class CommandPoller:
         try:
             new_path.parent.mkdir(parents=True, exist_ok=True)
             if old_path.exists() and old_path != new_path:
-                if new_path.exists() and new_path.is_dir():
-                    shutil.rmtree(new_path)
-                elif new_path.exists():
-                    new_path.unlink()
+                if new_path.exists():
+                    raise RuntimeError(f"Конфликт имени в целевой папке: {new_relative_path}")
                 old_path.rename(new_path)
             elif not new_path.exists():
                 new_path.mkdir(parents=True, exist_ok=True)
@@ -289,35 +401,112 @@ class CommandPoller:
                 namespace_id=command.namespace_id,
                 last_command_id=command.command_id,
             )
+            self._ensure_namespace_relocation_applied(old_path, new_path)
             self.log(f"Применено перемещение папки: {old_relative_path} -> {new_relative_path}")
         finally:
             self._set_remote_apply_for_subtree(old_relative_path, is_remote=False)
             self._set_remote_apply_for_subtree(new_relative_path, is_remote=False)
 
-    def _apply_trash(self, command: SyncCommand):
-        old_relative_path = self._resolve_existing_relative_path(command)
-        trash_relative_path = command.new_relative_path or command.relative_path
-        if not trash_relative_path:
-            filename = command.filename or (Path(old_relative_path).name if old_relative_path else None)
-            if not filename:
-                raise RuntimeError("Не удалось определить путь корзины")
-            trash_relative_path = f"{TRASH_DIRNAME}/{filename}"
+    def _apply_move_namespace(self, command: SyncCommand):
+        if command.namespace_id is None:
+            raise RuntimeError("Для move_namespace не указан namespace_id")
+        if command.target_parent_id is None:
+            raise RuntimeError("Для move_namespace не указан target_parent_id")
 
-        if command.target_type == "namespace":
-            self._apply_rename_or_move_namespace(
-                SyncCommand(
-                    command_id=command.command_id,
-                    command_type=command.command_type,
-                    relative_path=trash_relative_path,
-                    old_relative_path=old_relative_path or command.relative_path,
-                    new_relative_path=trash_relative_path,
-                    namespace_id=command.namespace_id,
-                    target_type="namespace",
-                    extra=command.extra,
-                )
+        old_relative_path, new_relative_path = self._build_target_namespace_relative_path(
+            command.namespace_id,
+            command.target_parent_id,
+        )
+        old_parent_path = Path(old_relative_path).parent.as_posix()
+        current_parent_path = "" if old_parent_path in {".", ""} else old_parent_path
+        target_parent_path = self._resolve_namespace_local_path(command.target_parent_id)
+        if target_parent_path is None:
+            raise RuntimeError(
+                f"Не удалось найти локальный parent namespace для target_parent_id={command.target_parent_id}"
             )
-            self.log(f"Папка перемещена в корзину по команде сервера: {trash_relative_path}")
+        if current_parent_path == target_parent_path:
+            self.log(f"Команда {command.command_type} уже была применена локально: {old_relative_path}")
             return
+        if new_relative_path.startswith(f"{old_relative_path}/"):
+            raise RuntimeError(
+                f"Нельзя переместить namespace {old_relative_path} внутрь собственного поддерева"
+            )
+
+        self._relocate_namespace(command, old_relative_path, new_relative_path)
+
+    def _apply_rename_namespace(self, command: SyncCommand):
+        if command.namespace_id is None:
+            raise RuntimeError("Для rename_namespace не указан namespace_id")
+        if not command.new_filename:
+            raise RuntimeError("Для rename_namespace не указано новое имя")
+
+        old_relative_path = self._resolve_namespace_local_path(command.namespace_id)
+        if old_relative_path is None:
+            raise RuntimeError(
+                f"Не удалось найти локальную папку для rename_namespace по namespace_id={command.namespace_id}"
+            )
+        if not old_relative_path:
+            raise RuntimeError("Нельзя переименовывать корневой namespace")
+
+        parent_relative_path = Path(old_relative_path).parent.as_posix()
+        new_relative_path = (
+            f"{parent_relative_path}/{command.new_filename}"
+            if parent_relative_path not in {".", ""}
+            else command.new_filename
+        )
+        if old_relative_path == new_relative_path:
+            self.log(f"Команда {command.command_type} уже была применена локально: {old_relative_path}")
+            return
+
+        self._relocate_namespace(command, old_relative_path, new_relative_path)
+
+    def _apply_move_file(self, command: SyncCommand):
+        old_relative_path = self._resolve_existing_relative_path(command)
+        if not old_relative_path:
+            raise RuntimeError(
+                f"Не удалось найти локальный файл для move_file по user_file_id={command.file_id}"
+            )
+        if command.target_namespace_id is None:
+            raise RuntimeError("Для move_file не указан target_namespace_id")
+
+        filename = Path(old_relative_path).name
+        new_relative_path = self._build_target_file_relative_path(
+            filename,
+            command.target_namespace_id,
+        )
+        self._relocate_file(command, old_relative_path, new_relative_path)
+
+    def _apply_rename_file(self, command: SyncCommand):
+        old_relative_path = self._resolve_existing_relative_path(command)
+        if not old_relative_path:
+            raise RuntimeError(
+                f"Не удалось найти локальный файл для rename_file по user_file_id={command.file_id}"
+            )
+        if not command.new_filename:
+            raise RuntimeError("Для rename_file не указан new_filename")
+
+        parent_relative_path = Path(old_relative_path).parent.as_posix()
+        new_relative_path = (
+            f"{parent_relative_path}/{command.new_filename}"
+            if parent_relative_path not in {".", ""}
+            else command.new_filename
+        )
+        self._relocate_file(command, old_relative_path, new_relative_path)
+
+    def _apply_trash_file(self, command: SyncCommand):
+        old_relative_path = self._resolve_existing_relative_path(command)
+        if not old_relative_path:
+            raise RuntimeError(
+                f"Не удалось найти локальный файл для trash_file по user_file_id={command.file_id}"
+            )
+        if command.target_namespace_id is None:
+            raise RuntimeError("Для trash_file не указан target_namespace_id")
+
+        filename = Path(old_relative_path).name
+        trash_relative_path = self._build_target_file_relative_path(
+            filename,
+            command.target_namespace_id,
+        )
 
         old_path = self.local_folder / old_relative_path if old_relative_path else None
         trash_path = self.local_folder / trash_relative_path
@@ -329,39 +518,48 @@ class CommandPoller:
                 if trash_path.exists() and trash_path != old_path:
                     trash_path.unlink()
                 old_path.rename(trash_path)
-            elif not trash_path.exists():
-                self._write_command_content(command, trash_path)
+            else:
+                raise RuntimeError(f"Локальный файл для trash-команды не найден: {old_relative_path}")
 
             if old_relative_path:
                 self.db.rename_file_state(old_relative_path, trash_relative_path)
+            self._ensure_file_relocation_applied(old_path, trash_path)
             self._update_file_state_from_disk(trash_relative_path, trash_path, command)
             self.log(f"Файл перемещён в корзину по команде сервера: {trash_relative_path}")
         finally:
             self._mark_file_paths_remote_apply(old_relative_path, trash_relative_path, is_remote=False)
 
-    def _apply_upsert(self, command: SyncCommand):
-        if command.target_type == "namespace":
-            target_path = self.local_folder / command.relative_path
-            self._mark_folder_paths_remote_apply(command.relative_path, is_remote=True)
-            try:
-                target_path.mkdir(parents=True, exist_ok=True)
-                self._ensure_folder_chain(
-                    command.relative_path,
-                    namespace_id=command.namespace_id,
-                    last_command_id=command.command_id,
-                )
-                self.log(f"Создана папка по команде сервера: {command.relative_path}")
-            finally:
-                self._mark_folder_paths_remote_apply(command.relative_path, is_remote=False)
-            return
+    def _apply_upsert_file(self, command: SyncCommand):
+        if command.file_id is None:
+            raise RuntimeError("Для upsert_file не указан user_file_id")
+        if not command.content_hash:
+            raise RuntimeError("Для upsert_file не указан content_hash")
 
-        target_path = self.local_folder / command.relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        self._mark_file_paths_remote_apply(command.relative_path, is_remote=True)
+        existing_relative_path = self._resolve_existing_relative_path(command)
+        old_path = self.local_folder / existing_relative_path if existing_relative_path else None
+        target_relative_path = self._resolve_upsert_target_relative_path(command, existing_relative_path)
+        target_path = self.local_folder / target_relative_path
+        self._mark_file_paths_remote_apply(existing_relative_path, target_relative_path, is_remote=True)
 
         try:
-            self._write_command_content(command, target_path)
-            self._update_file_state_from_disk(command.relative_path, target_path, command)
-            self.log(f"Применена команда сервера: {command.relative_path}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if old_path and old_path.exists() and old_path != target_path:
+                if target_path.exists() and target_path != old_path:
+                    target_path.unlink()
+                old_path.rename(target_path)
+
+            local_exists = target_path.exists() and target_path.is_file()
+            local_hash = compute_file_hash(target_path) if local_exists else None
+            should_download = not local_exists or local_hash != command.content_hash
+            if should_download:
+                self._download_file_for_command(command, target_path)
+
+            if existing_relative_path and existing_relative_path != target_relative_path:
+                self.db.rename_file_state(existing_relative_path, target_relative_path)
+
+            self._ensure_file_relocation_applied(old_path if old_path and old_path != target_path else None, target_path)
+            self._update_file_state_from_disk(target_relative_path, target_path, command)
+            self.log(f"Применена команда сервера: {target_relative_path}")
         finally:
-            self._mark_file_paths_remote_apply(command.relative_path, is_remote=False)
+            self._mark_file_paths_remote_apply(existing_relative_path, target_relative_path, is_remote=False)

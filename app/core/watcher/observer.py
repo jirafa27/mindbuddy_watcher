@@ -15,6 +15,7 @@ class FileWatcher:
         self,
         folder_path,
         on_file_changed_callback=None,
+        on_folder_created_callback=None,
         on_file_deleted_callback=None,
         on_file_moved_callback=None,
         on_folder_moved_callback=None,
@@ -24,6 +25,7 @@ class FileWatcher:
     ):
         self.folder_path = Path(folder_path)
         self.on_file_changed = on_file_changed_callback
+        self.on_folder_created = on_folder_created_callback
         self.on_file_deleted = on_file_deleted_callback
         self.on_file_moved = on_file_moved_callback
         self.on_folder_moved = on_folder_moved_callback
@@ -42,6 +44,7 @@ class FileWatcher:
             
         self.event_handler = FileWatcherHandler(
             on_file_changed_callback=self.on_file_changed,
+            on_folder_created_callback=self.on_folder_created,
             on_file_deleted_callback=self.on_file_deleted,
             on_file_moved_callback=self.on_file_moved,
             on_folder_moved_callback=self.on_folder_moved,

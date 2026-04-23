@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from app.core.contracts import SyncMismatchReport
+
 from .namespace_utils import flatten_namespace_list, get_namespace_paths
 from .types import InitialSyncFacade, SyncStrategy
 
@@ -12,7 +14,10 @@ from .types import InitialSyncFacade, SyncStrategy
 logger = logging.getLogger("app.core.sync")
 
 
-def run_initial_sync(file_sync: InitialSyncFacade, strategy: Optional[SyncStrategy] = None) -> None:
+def run_initial_sync(
+    file_sync: InitialSyncFacade,
+    strategy: Optional[SyncStrategy] = None,
+) -> Optional[SyncMismatchReport]:
     """Выполняет первичную инициализацию связки token + folder."""
     local_structure = file_sync.get_local_structure()
     remote_structure = file_sync.api_client.get_files_server_structure()
@@ -57,4 +62,4 @@ def run_initial_sync(file_sync: InitialSyncFacade, strategy: Optional[SyncStrate
             elif result["status"] == "failed":
                 logger.warning(f"Ошибка загрузки {relative_path}: {result.get('message')}")
 
-    file_sync.refresh_last_sync_snapshot_if_synced()
+    return file_sync.refresh_last_sync_snapshot_if_synced()

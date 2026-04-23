@@ -21,20 +21,17 @@ class SyncAPIClient:
         base_url: str,
         token: str,
         device_id: str,
-        vault_name: str = "",
         timeout: int = 30,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.device_id = device_id
-        self.vault_name = vault_name
         self.timeout = timeout
         self.session = requests.Session()
 
         self.sync_upload_endpoint = f"{self.base_url}/sync/upload"
         self.sync_commands_endpoint = f"{self.base_url}/sync/commands"
         self.sync_structure_endpoint = f"{self.base_url}/sync/structure"
-        self.sync_file_content_endpoint = f"{self.base_url}/sync/file-content"
         self.sync_namespaces_endpoint = f"{self.base_url}/sync/namespaces"
         self.namespaces_endpoint = f"{self.base_url}/namespaces/"
 
@@ -44,14 +41,6 @@ class SyncAPIClient:
             "Accept": "application/json",
             "X-Device-Id": self.device_id,
         }
-
-    def _params(self, extra: Optional[Dict] = None) -> Dict:
-        params: Dict = {"device_id": self.device_id}
-        if self.vault_name:
-            params["vault_name"] = self.vault_name
-        if extra:
-            params.update(extra)
-        return params
 
     def _extract_data(self, response: requests.Response):
         try:
@@ -65,14 +54,15 @@ class SyncAPIClient:
     def upload_desktop_file(
         self,
         file_path: Path,
-        relative_path: str,
+        parent_namespace_id: int,
+        filename: str,
         user_file_id: Optional[int] = None,
     ) -> UploadResult:
         """Загружает локальную desktop-версию файла на сервер"""
         try:
             payload = {
-                "relative_path": relative_path,
-                "vault_name": self.vault_name,
+                "namespace_id": parent_namespace_id,
+                "filename": filename,
             }
             if user_file_id is not None:
                 payload["user_file_id"] = user_file_id
@@ -118,7 +108,7 @@ class SyncAPIClient:
             response = self.session.get(
                 self.sync_commands_endpoint,
                 headers=self._headers(),
-                params=self._params({"limit": limit}),
+                params={"limit": limit},
                 timeout=self.timeout,
             )
             if not response.ok:
@@ -159,7 +149,6 @@ class SyncAPIClient:
             response = self.session.post(
                 f"{self.sync_commands_endpoint}/ack",
                 headers=self._headers(),
-                params=self._params(),
                 json=payload,
                 timeout=self.timeout,
             )
@@ -201,13 +190,14 @@ class SyncAPIClient:
 
     def create_namespace(
         self,
-        relative_path: str,
+        name: str,
+        parent_namespace_id: int,
         description: str = "",
     ) -> Optional[NamespaceStructureItem]:
         """Создаёт namespace по sync-эндпоинту watcher."""
         payload: Dict[str, Any] = {
-            "relative_path": relative_path,
-            "vault_name": self.vault_name,
+            "name": name,
+            "parent_namespace_id": parent_namespace_id,
             "description": description,
         }
 
@@ -220,8 +210,9 @@ class SyncAPIClient:
             )
             if not response.ok:
                 logger.error(
-                    "Не удалось создать namespace %s: %s - %s",
-                    relative_path,
+                    "Не удалось создать namespace %s в parent id=%s: %s - %s",
+                    name,
+                    parent_namespace_id,
                     response.status_code,
                     response.text[:400],
                 )
@@ -232,7 +223,12 @@ class SyncAPIClient:
                 return None
             return NamespaceStructureItem.from_dict(payload)
         except Exception as error:
-            logger.error("Ошибка создания namespace %s: %s", relative_path, error)
+            logger.error(
+                "Ошибка создания namespace %s в parent id=%s: %s",
+                name,
+                parent_namespace_id,
+                error,
+            )
             return None
 
     def delete_namespace(self, namespace_id: int) -> bool:
@@ -255,6 +251,60 @@ class SyncAPIClient:
             logger.error("Ошибка удаления namespace id=%s: %s", namespace_id, error)
             return False
 
+    def move_namespace(self, namespace_id: int, target_parent_id: int) -> bool:
+        """Перемещает namespace в другой parent namespace."""
+        try:
+            response = self.session.put(
+                f"{self.sync_namespaces_endpoint}/{namespace_id}/move",
+                headers=self._headers(),
+                json={"target_parent_id": target_parent_id},
+                timeout=self.timeout,
+            )
+            if not response.ok:
+                logger.error(
+                    "Не удалось переместить namespace id=%s в parent id=%s: %s - %s",
+                    namespace_id,
+                    target_parent_id,
+                    response.status_code,
+                    response.text[:200],
+                )
+            return response.ok
+        except Exception as error:
+            logger.error(
+                "Ошибка перемещения namespace id=%s в parent id=%s: %s",
+                namespace_id,
+                target_parent_id,
+                error,
+            )
+            return False
+
+    def rename_namespace(self, namespace_id: int, new_name: str) -> bool:
+        """Переименовывает namespace по sync-эндпоинту watcher."""
+        try:
+            response = self.session.put(
+                f"{self.sync_namespaces_endpoint}/{namespace_id}/rename",
+                headers=self._headers(),
+                json={"new_name": new_name},
+                timeout=self.timeout,
+            )
+            if not response.ok:
+                logger.error(
+                    "Не удалось переименовать namespace id=%s в %s: %s - %s",
+                    namespace_id,
+                    new_name,
+                    response.status_code,
+                    response.text[:200],
+                )
+            return response.ok
+        except Exception as error:
+            logger.error(
+                "Ошибка переименования namespace id=%s в %s: %s",
+                namespace_id,
+                new_name,
+                error,
+            )
+            return False
+
     def delete_server_file(self, file_id: int) -> bool:
         """Полностью удаляет user_file на сервере по его ID."""
         try:
@@ -268,6 +318,28 @@ class SyncAPIClient:
             return response.ok
         except Exception as error:
             logger.error("Ошибка удаления файла id=%s: %s", file_id, error)
+            return False
+
+    def rename_server_file(self, file_id: int, new_name: str) -> bool:
+        """Переименовывает файл на сервере по его ID."""
+        try:
+            response = self.session.put(
+                f"{self.base_url}/sync/files/{file_id}",
+                headers=self._headers(),
+                params={"new_name": new_name},
+                timeout=self.timeout,
+            )
+            if not response.ok:
+                logger.error(
+                    "Не удалось переименовать файл id=%s в %s: %s - %s",
+                    file_id,
+                    new_name,
+                    response.status_code,
+                    response.text[:200],
+                )
+            return response.ok
+        except Exception as error:
+            logger.error("Ошибка переименования файла id=%s в %s: %s", file_id, new_name, error)
             return False
 
     def download_file_by_id(self, file_id: int, destination: Path) -> bool:
@@ -297,44 +369,4 @@ class SyncAPIClient:
             return True
         except Exception as error:
             logger.error("Ошибка скачивания файла id=%s: %s", file_id, error)
-            return False
-
-    def download_file(
-        self,
-        relative_path: str,
-        destination: Path,
-        download_url: Optional[str] = None,
-    ) -> bool:
-        """Скачивает файл по относительному пути или прямому URL."""
-        target_url = download_url or self.sync_file_content_endpoint
-        request_kwargs = {
-            "headers": self._headers(),
-            "timeout": self.timeout * 2,
-            "stream": True,
-        }
-
-        if download_url:
-            request_kwargs["params"] = {}
-        else:
-            request_kwargs["params"] = self._params({"relative_path": relative_path})
-
-        try:
-            response = self.session.get(target_url, **request_kwargs)
-            if not response.ok:
-                logger.error(
-                    "Не удалось скачать файл %s: %s - %s",
-                    relative_path,
-                    response.status_code,
-                    response.text[:200],
-                )
-                return False
-
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with open(destination, "wb") as file_handle:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        file_handle.write(chunk)
-            return True
-        except Exception as error:
-            logger.error("Ошибка скачивания файла %s: %s", relative_path, error)
             return False

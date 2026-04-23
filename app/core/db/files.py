@@ -72,6 +72,7 @@ def get_file_state_by_server_user_file_id(db: DBContext, file_id: int) -> Option
                     SELECT {FILE_STATE_COLUMNS}
                     FROM files
                     WHERE token = ? AND server_user_file_id = ?
+                    ORDER BY updated_at DESC
                     LIMIT 1
                 """,
                 (db.token, file_id),
@@ -156,6 +157,40 @@ def delete_file_states_under_prefix(db: DBContext, relative_prefix: str) -> bool
             return True
     except Exception as error:
         logger.error("Ошибка удаления file_state под префиксом %s: %s", relative_prefix, error)
+        return False
+
+
+def delete_file_states_by_server_user_file_id(
+    db: DBContext,
+    file_id: int,
+    keep_relative_path: Optional[str] = None,
+) -> bool:
+    """Удаляет все file-state записи по server_user_file_id, кроме keep_relative_path."""
+    try:
+        with connect(db.db_path) as conn:
+            cursor = conn.cursor()
+            if keep_relative_path:
+                cursor.execute(
+                    """
+                        DELETE FROM files
+                        WHERE token = ? AND server_user_file_id = ? AND relative_path != ?
+                    """,
+                    (db.token, file_id, keep_relative_path),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM files WHERE token = ? AND server_user_file_id = ?",
+                    (db.token, file_id),
+                )
+            conn.commit()
+            return True
+    except Exception as error:
+        logger.error(
+            "Ошибка удаления file_state по file_id=%s с keep_relative_path=%s: %s",
+            file_id,
+            keep_relative_path,
+            error,
+        )
         return False
 
 

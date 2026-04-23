@@ -4,25 +4,70 @@ import enum
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
 
-from app.core.namespace_constants import VAULT_ROOT_NAME
-
-
-def _strip_vault_prefix(path: str) -> str:
-    if not path:
-        return ""
-    normalized = path.replace("\\", "/")
-    vault_prefix = f"{VAULT_ROOT_NAME}/"
-    if normalized == VAULT_ROOT_NAME:
-        return ""
-    if normalized.startswith(vault_prefix):
-        return normalized[len(vault_prefix):]
-    return normalized
-
 
 class SyncCommandAckStatus(enum.StrEnum):
     ACKED = "acked"
     FAILED = "failed"
     PENDING = "pending"
+
+
+class SyncCommandType(enum.StrEnum):
+    UPSERT_FILE = "upsert_file"
+    MOVE_FILE = "move_file"
+    RENAME_FILE = "rename_file"
+    TRASH_FILE = "trash_file"
+    DELETE_NAMESPACE = "delete_namespace"
+    DELETE_FILE = "delete_file"
+    MOVE_NAMESPACE = "move_namespace"
+    RENAME_NAMESPACE = "rename_namespace"
+    TRASH_NAMESPACE = "trash_namespace"
+
+
+class SyncMismatchItemKind(enum.StrEnum):
+    FILE = "file"
+    FOLDER = "folder"
+
+
+class SyncMismatchType(enum.StrEnum):
+    LOCAL_ONLY = "local_only"
+    REMOTE_ONLY = "remote_only"
+    CONTENT_DIFF = "content_diff"
+    PATH_CHANGED = "path_changed"
+
+
+class SyncResolutionAction(enum.StrEnum):
+    USE_LOCAL = "use_local"
+    USE_REMOTE = "use_remote"
+    SKIP = "skip"
+
+
+@dataclass(frozen=True)
+class SyncMismatchItem:
+    path: str
+    item_kind: SyncMismatchItemKind
+    mismatch_type: SyncMismatchType
+    local_hash: Optional[str] = None
+    remote_hash: Optional[str] = None
+    local_path: Optional[str] = None
+    remote_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SyncMismatchResolution:
+    path: str
+    item_kind: SyncMismatchItemKind
+    mismatch_type: SyncMismatchType
+    action: SyncResolutionAction
+    local_path: Optional[str] = None
+    remote_path: Optional[str] = None
+
+
+@dataclass
+class SyncMismatchReport:
+    items: List[SyncMismatchItem] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.items
 
 
 @dataclass
@@ -124,85 +169,86 @@ class SyncCommand:
     """Команда для применения серверных изменений локально на ПК."""
 
     command_id: str
-    command_type: str
+    command_type: Optional[SyncCommandType]
     relative_path: str
-    old_relative_path: Optional[str] = None
-    new_relative_path: Optional[str] = None
     filename: Optional[str] = None
+    new_filename: Optional[str] = None
     file_id: Optional[int] = None
     namespace_id: Optional[int] = None
-    target_type: Optional[str] = None
+    target_namespace_id: Optional[int] = None
+    target_parent_id: Optional[int] = None
     content_hash: Optional[str] = None
-    content: Optional[str] = None
-    content_base64: Optional[str] = None
-    download_url: Optional[str] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "SyncCommand":
         command_id = payload.get("id") or payload.get("command_id")
-
-        # Backend вкладывает данные файла в поле "payload"
+        raw_command_type = payload.get("command_type") or ""
+        try:
+            command_type = SyncCommandType(raw_command_type) if raw_command_type else None
+        except ValueError:
+            command_type = None
         nested: Dict[str, Any] = payload.get("payload") or {}
+        relative_path = (
+            nested.get("relative_path")
+            or payload.get("relative_path")
+            or payload.get("path")
+            or ""
+        )
 
-        # relative_path: из vault_relative_path без первого компонента (имени vault)
-        vault_relative = nested.get("vault_relative_path") or ""
-        if vault_relative:
-            relative_path = _strip_vault_prefix(vault_relative)
-        else:
-            relative_path = (
-                nested.get("relative_path")
-                or payload.get("relative_path")
-                or payload.get("path")
-                or ""
-            )
-
-        old_relative_path = _strip_vault_prefix(nested.get("old_vault_relative_path") or "")
-        new_relative_path = _strip_vault_prefix(nested.get("new_vault_relative_path") or "")
         raw_file_id = nested.get("user_file_id") or nested.get("file_id") or payload.get("file_id")
         raw_namespace_id = nested.get("namespace_id") or payload.get("namespace_id")
+        raw_target_namespace_id = nested.get("target_namespace_id") or payload.get("target_namespace_id")
+        raw_target_parent_id = nested.get("target_parent_id") or payload.get("target_parent_id")
+
+        extra = {
+            key: value
+            for key, value in payload.items()
+            if key
+            not in {
+                "id",
+                "command_id",
+                "type",
+                "command_type",
+                "relative_path",
+                "path",
+                "payload",
+                "content_hash",
+                "namespace_id",
+                "target_namespace_id",
+                "target_parent_id",
+                "new_filename",
+                "new_name",
+            }
+        }
+        if command_type is None and raw_command_type:
+            extra["unsupported_command_type"] = raw_command_type
 
         return cls(
             command_id=str(command_id),
-            command_type=payload.get("command_type") or payload.get("type") or "upsert",
+            command_type=command_type,
             relative_path=relative_path,
-            old_relative_path=old_relative_path or None,
-            new_relative_path=new_relative_path or None,
             filename=nested.get("filename") or payload.get("filename"),
+            new_filename=(
+                nested.get("new_filename")
+                or payload.get("new_filename")
+                or nested.get("new_name")
+                or payload.get("new_name")
+            ),
             file_id=int(raw_file_id) if raw_file_id is not None else None,
             namespace_id=int(raw_namespace_id) if raw_namespace_id is not None else None,
-            target_type=nested.get("target_type") or payload.get("target_type"),
+            target_namespace_id=(
+                int(raw_target_namespace_id)
+                if raw_target_namespace_id is not None
+                else None
+            ),
+            target_parent_id=(
+                int(raw_target_parent_id)
+                if raw_target_parent_id is not None
+                else None
+            ),
             content_hash=nested.get("content_hash") or payload.get("content_hash"),
-            content=nested.get("content") or payload.get("content"),
-            content_base64=(
-                nested.get("content_base64") or nested.get("data")
-                or payload.get("content_base64") or payload.get("data")
-            ),
-            download_url=(
-                nested.get("download_url") or nested.get("url")
-                or payload.get("download_url") or payload.get("url")
-            ),
-            extra={
-                key: value
-                for key, value in payload.items()
-                if key
-                not in {
-                    "id",
-                    "command_id",
-                    "type",
-                    "command_type",
-                    "relative_path",
-                    "path",
-                    "payload",
-                    "content_hash",
-                    "content",
-                    "content_base64",
-                    "data",
-                    "download_url",
-                    "url",
-                    "namespace_id",
-                }
-            },
+            extra=extra,
         )
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Set
 
 from app.core.api_client import SyncAPIClient
-from app.core.contracts import IndexedFileMeta, LocalFileMeta, NamespaceStructureItem
+from app.core.contracts import IndexedFileMeta, LocalFileMeta, NamespaceStructureItem, SyncMismatchReport
 from app.core.db import SettingsDB
 from app.core.uploader import FileUploader
 
@@ -62,7 +62,7 @@ class InitialSyncFacade(Protocol):
         namespace_paths: Set[str],
         remote_structure: List[NamespaceStructureItem],
     ) -> int: ...
-    def refresh_last_sync_snapshot_if_synced(self) -> None: ...
+    def refresh_last_sync_snapshot_if_synced(self) -> Optional[SyncMismatchReport]: ...
 
 
 class RestartSyncFacade(Protocol):
@@ -99,4 +99,4 @@ class RestartSyncFacade(Protocol):
         namespace_paths: Set[str],
         remote_structure: List[NamespaceStructureItem],
     ) -> int: ...
-    def refresh_last_sync_snapshot_if_synced(self) -> None: ...
+    def refresh_last_sync_snapshot_if_synced(self) -> Optional[SyncMismatchReport]: ...

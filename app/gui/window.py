@@ -4,8 +4,16 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from pathlib import Path
 import threading
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+from app.core.contracts import (
+    SyncMismatchItem,
+    SyncMismatchItemKind,
+    SyncMismatchReport,
+    SyncMismatchResolution,
+    SyncMismatchType,
+    SyncResolutionAction,
+)
 from app.core.db import SettingsDB
 from app.core.sync import SyncStrategy
 
@@ -364,6 +372,190 @@ class WatcherGUI:
         self.root.wait_window(dialog)
         return result["strategy"]
 
+    def ask_sync_mismatch_resolutions(
+        self,
+        report: SyncMismatchReport,
+    ) -> Optional[List[SyncMismatchResolution]]:
+        """Показывает диалог поэлементного разрешения рассинхрона."""
+        result = {"resolutions": None}
+
+        def default_action(item: SyncMismatchItem) -> SyncResolutionAction:
+            if item.mismatch_type == SyncMismatchType.LOCAL_ONLY:
+                return SyncResolutionAction.USE_LOCAL
+            if item.mismatch_type == SyncMismatchType.REMOTE_ONLY:
+                return SyncResolutionAction.USE_REMOTE
+            if item.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                return SyncResolutionAction.SKIP
+            return SyncResolutionAction.SKIP
+
+        def mismatch_label(item: SyncMismatchItem) -> str:
+            if item.item_kind == SyncMismatchItemKind.FILE:
+                if item.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                    same_content = (
+                        item.local_hash is not None
+                        and item.remote_hash is not None
+                        and item.local_hash == item.remote_hash
+                    )
+                    content_note = (
+                        "Содержимое совпадает, отличается только путь/имя"
+                        if same_content
+                        else "Один и тот же файл имеет разные путь/имя и содержимое"
+                    )
+                    return (
+                        f"{content_note}\n"
+                        f"ПК: {item.local_path or item.path}\n"
+                        f"Сервер: {item.remote_path or item.path}"
+                    )
+                if item.mismatch_type == SyncMismatchType.LOCAL_ONLY:
+                    return "Файл есть только на ПК"
+                if item.mismatch_type == SyncMismatchType.REMOTE_ONLY:
+                    return "Файл есть только на сервере"
+                return (
+                    "Файл отличается по содержимому\n"
+                    f"ПК: {item.local_hash}\n"
+                    f"Сервер: {item.remote_hash}"
+                )
+
+            if item.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                return (
+                    "Один и тот же namespace имеет разные путь/имя\n"
+                    f"ПК: {item.local_path or item.path}\n"
+                    f"Сервер: {item.remote_path or item.path}"
+                )
+            if item.mismatch_type == SyncMismatchType.LOCAL_ONLY:
+                return "Папка есть только на ПК"
+            return "Папка есть только на сервере"
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Разрешение рассинхрона")
+        dialog.geometry("900x560")
+        dialog.minsize(760, 420)
+        dialog.grab_set()
+        dialog.transient(self.root)
+
+        file_count = sum(1 for item in report.items if item.item_kind == SyncMismatchItemKind.FILE)
+        folder_count = sum(1 for item in report.items if item.item_kind == SyncMismatchItemKind.FOLDER)
+
+        tk.Label(
+            dialog,
+            text="Обнаружены расхождения между ПК и сервером",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor=tk.W, padx=15, pady=(15, 5))
+        tk.Label(
+            dialog,
+            text=(
+                f"Файлы: {file_count}, папки: {folder_count}.\n"
+                "Выберите для каждого элемента, чью версию считать источником истины."
+            ),
+            justify=tk.LEFT,
+            wraplength=820,
+        ).pack(anchor=tk.W, padx=15, pady=(0, 10))
+
+        canvas_frame = tk.Frame(dialog)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+
+        canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+        scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+        content = tk.Frame(canvas)
+
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        choice_vars: Dict[int, tk.StringVar] = {}
+        for index, item in enumerate(report.items):
+            row = tk.Frame(content, relief=tk.GROOVE, borderwidth=1, padx=8, pady=8)
+            row.pack(fill=tk.X, expand=True, pady=4)
+
+            item_title = "Файл" if item.item_kind == SyncMismatchItemKind.FILE else "Папка"
+            item_path_label = item.path
+            if item.mismatch_type == SyncMismatchType.PATH_CHANGED:
+                item_path_label = f"{item.local_path or item.path} <-> {item.remote_path or item.path}"
+            tk.Label(
+                row,
+                text=f"{item_title}: {item_path_label}",
+                font=("Arial", 10, "bold"),
+                anchor=tk.W,
+                justify=tk.LEFT,
+            ).pack(anchor=tk.W)
+            tk.Label(
+                row,
+                text=mismatch_label(item),
+                justify=tk.LEFT,
+                wraplength=760,
+                anchor=tk.W,
+            ).pack(anchor=tk.W, pady=(4, 6))
+
+            action_var = tk.StringVar(value=default_action(item).value)
+            choice_vars[index] = action_var
+
+            actions_frame = tk.Frame(row)
+            actions_frame.pack(anchor=tk.W)
+            tk.Radiobutton(
+                actions_frame,
+                text="ПК",
+                variable=action_var,
+                value=SyncResolutionAction.USE_LOCAL.value,
+            ).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Radiobutton(
+                actions_frame,
+                text="Сервер",
+                variable=action_var,
+                value=SyncResolutionAction.USE_REMOTE.value,
+            ).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Radiobutton(
+                actions_frame,
+                text="Пропустить",
+                variable=action_var,
+                value=SyncResolutionAction.SKIP.value,
+            ).pack(side=tk.LEFT)
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+
+        def apply_choices():
+            result["resolutions"] = [
+                SyncMismatchResolution(
+                    path=item.path,
+                    item_kind=item.item_kind,
+                    mismatch_type=item.mismatch_type,
+                    action=SyncResolutionAction(choice_vars[index].get()),
+                    local_path=item.local_path,
+                    remote_path=item.remote_path,
+                )
+                for index, item in enumerate(report.items)
+            ]
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame,
+            text="Применить выбранное",
+            command=apply_choices,
+            width=22,
+            height=2,
+        ).pack(side=tk.LEFT, padx=5)
+        tk.Button(
+            btn_frame,
+            text="Отмена",
+            command=dialog.destroy,
+            width=12,
+            height=2,
+        ).pack(side=tk.LEFT, padx=5)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + max((self.root.winfo_width() - dialog.winfo_width()) // 2, 0)
+        y = self.root.winfo_y() + max((self.root.winfo_height() - dialog.winfo_height()) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
+
+        self.root.wait_window(dialog)
+        return result["resolutions"]
+
     def confirm_initial_sync_replace(self, strategy: SyncStrategy) -> bool:
         """Подтверждение полной замены одной стороны другой при initial sync."""
         if strategy == SyncStrategy.SERVER_PRIORITY:
@@ -379,6 +571,80 @@ class WatcherGUI:
                 "Продолжить?"
             )
         return messagebox.askyesno(title, message, parent=self.root)
+
+    def ask_root_folder_deleted_action(self, deleted_folder: Path) -> Optional[str]:
+        """Спрашивает, что делать после удаления корневой папки watcher."""
+        result = {"action": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Корневая папка удалена")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self.root)
+
+        tk.Label(
+            dialog,
+            text="Корневая папка watcher была удалена",
+            font=("Arial", 11, "bold"),
+        ).pack(anchor=tk.W, padx=15, pady=(15, 5))
+
+        tk.Label(
+            dialog,
+            text=(
+                f"Путь: {deleted_folder}\n\n"
+                "Можно выбрать новую папку для продолжения работы или "
+                "восстановить текущую папку по структуре сервера."
+            ),
+            justify=tk.LEFT,
+            wraplength=460,
+        ).pack(anchor=tk.W, padx=15, pady=(0, 12))
+
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+
+        def choose(action: str):
+            result["action"] = action
+            dialog.destroy()
+
+        tk.Button(
+            btn_frame,
+            text="Выбрать новую папку",
+            command=lambda: choose("choose_new"),
+            width=22,
+            height=2,
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Восстановить с сервера",
+            command=lambda: choose("restore"),
+            width=22,
+            height=2,
+        ).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(
+            btn_frame,
+            text="Остановить watcher",
+            command=dialog.destroy,
+            width=18,
+            height=2,
+        ).pack(side=tk.LEFT, padx=5)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + max((self.root.winfo_width() - dialog.winfo_width()) // 2, 0)
+        y = self.root.winfo_y() + max((self.root.winfo_height() - dialog.winfo_height()) // 2, 0)
+        dialog.geometry(f"+{x}+{y}")
+
+        self.root.wait_window(dialog)
+        return result["action"]
+
+    def ask_new_root_folder(self) -> Optional[Path]:
+        """Показывает системный выбор новой корневой папки watcher."""
+        folder = filedialog.askdirectory(
+            title="Выберите новую корневую папку watcher",
+            parent=self.root,
+        )
+        return Path(folder) if folder else None
 
     def on_closing(self):
         """Обработка закрытия окна"""

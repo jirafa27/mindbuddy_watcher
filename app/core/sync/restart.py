@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, Optional, Set
 
-from app.core.contracts import IndexedFileMeta, LocalFileMeta
+from app.core.contracts import IndexedFileMeta, LocalFileMeta, SyncMismatchReport
 
 from .namespace_utils import flatten_namespace_list, get_namespace_paths
 from .types import RestartSyncContext, RestartSyncFacade
@@ -20,7 +20,7 @@ class RestartSyncRunner:
     def __init__(self, file_sync: RestartSyncFacade):
         self.file_sync = file_sync
 
-    def run(self) -> None:
+    def run(self) -> Optional[SyncMismatchReport]:
         logger.info("Запущена синхронизация после перезапуска watcher...")
         context = self._build_restart_sync_context()
         self._sync_directory_changes(context)
@@ -29,7 +29,7 @@ class RestartSyncRunner:
         self._upload_new_local_files(context)
         self._apply_new_remote_files(context)
         self._apply_removed_directory_changes(context)
-        self.file_sync.refresh_last_sync_snapshot_if_synced()
+        return self.file_sync.refresh_last_sync_snapshot_if_synced()
 
     def _build_restart_sync_context(self) -> RestartSyncContext:
         local_structure = self.file_sync.get_local_structure()

@@ -88,6 +88,17 @@ class SettingsDB:
     def delete_file_states_under_prefix(self, relative_prefix: str) -> bool:
         return files.delete_file_states_under_prefix(self, relative_prefix)
 
+    def delete_file_states_by_server_user_file_id(
+        self,
+        file_id: int,
+        keep_relative_path: Optional[str] = None,
+    ) -> bool:
+        return files.delete_file_states_by_server_user_file_id(
+            self,
+            file_id,
+            keep_relative_path=keep_relative_path,
+        )
+
     def rename_file_state(self, old_path: str, new_path: str) -> bool:
         return files.rename_file_state(self, old_path, new_path)
 

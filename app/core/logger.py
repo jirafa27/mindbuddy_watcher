@@ -6,7 +6,7 @@ import logging
 
 from app.gui import WatcherGUI
 
-SYNC_LOGGER_NAME = "app.core.sync"
+APP_CORE_LOGGER_NAME = "app.core"
 DEFAULT_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
@@ -19,7 +19,7 @@ def configure_logging(level: int = logging.INFO) -> None:
 
 
 class SyncGuiLogHandler(logging.Handler):
-    """Пересылает лог синхронизации в окно (через thread-safe WatcherGUI.log)."""
+    """Пересылает логи ядра в окно (через thread-safe WatcherGUI.log)."""
 
     def __init__(self, gui: WatcherGUI):
         super().__init__(level=logging.DEBUG)
@@ -34,9 +34,9 @@ class SyncGuiLogHandler(logging.Handler):
 
 
 def add_log_handler(gui: WatcherGUI) -> None:
-    """Вешает SyncGuiLogHandler на логгер модуля sync."""
-    sync_log = logging.getLogger(SYNC_LOGGER_NAME)
-    if any(isinstance(h, SyncGuiLogHandler) for h in sync_log.handlers):
+    """Вешает SyncGuiLogHandler на app.core.* логгеры."""
+    app_core_log = logging.getLogger(APP_CORE_LOGGER_NAME)
+    if any(isinstance(h, SyncGuiLogHandler) for h in app_core_log.handlers):
         return
-    sync_log.addHandler(SyncGuiLogHandler(gui))
-    sync_log.setLevel(logging.INFO)
+    app_core_log.addHandler(SyncGuiLogHandler(gui))
+    app_core_log.setLevel(logging.INFO)
